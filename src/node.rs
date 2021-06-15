@@ -26,6 +26,55 @@ impl Term {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LogEntry {
+    seq: u64,
+    op: ops::Operation,
+}
+
+struct Log {
+    entries: Vec<LogEntry>,
+    base_seq: u64,
+    next_seq: u64,
+    committed_seq: u64,
+}
+
+impl Log {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            base_seq: 0,
+            next_seq: 0,
+            committed_seq: 0,
+        }
+    }
+
+    fn append(&mut self, op: ops::Operation) {
+        self.push(LogEntry {
+            seq: self.next_seq,
+            op,
+        });
+    }
+
+    fn push(&mut self, entry: LogEntry) {
+        self.entries.push(entry);
+        self.next_seq = entry.seq + 1;
+    }
+
+    fn commit(&mut self, seq: u64) {
+        self.committed_seq = seq + 1;
+    }
+
+    fn uncommitted_entries(&self) -> Vec<LogEntry> {
+        let first = (self.committed_seq - self.base_seq) as usize;
+        if self.entries.len() > first {
+            self.entries[first..].to_vec()
+        } else {
+            vec![]
+        }
+    }
+}
+
 pub struct RaftNode<T: Transport> {
     id: u32,
     term: Term,
@@ -33,6 +82,7 @@ pub struct RaftNode<T: Transport> {
     nodes: Vec<u32>,
     state: NodeState,
     value: i32,
+    log: Log,
 }
 
 fn next_election_timeout() -> Duration {
@@ -45,7 +95,7 @@ fn next_election_timeout() -> Duration {
 
 pub struct CandidateState {
     timeout_at: Instant,
-    vote_count: u32,
+    vote_count: usize,
 }
 
 impl CandidateState {
@@ -73,12 +123,16 @@ impl FollowerState {
 
 pub struct LeaderState {
     next_append_at: Instant,
+    last_append_seq: i64,
+    current_acks: usize,
 }
 
 impl LeaderState {
     pub fn new() -> Self {
         Self {
             next_append_at: Instant::now() + HEARTBEAT_TIMEOUT,
+            last_append_seq: -1,
+            current_acks: 0,
         }
     }
 }
@@ -106,14 +160,23 @@ pub struct NodeStatus {
     pub leader: i32,
     pub term: u64,
     pub election_timeout: Duration,
+    pub value: i32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Message {
-    RequestVote { term: u64 },
+    RequestVote {
+        term: u64,
+    },
     Vote,
-    AppendEntries { term: u64 },
+    AppendEntries {
+        term: u64,
+        entries: Vec<LogEntry>,
+        committed_seq: u64,
+    },
 
+    UpdateValue(ops::Operation),
+    UpdateValueResult(Option<&'static str>),
     ShowStatus,
     Status(NodeStatus),
 }
@@ -127,6 +190,7 @@ impl<T: Transport> RaftNode<T> {
             transport,
             state: NodeState::Follower(FollowerState::new(None)),
             value: 0,
+            log: Log::new(),
         }
     }
 
@@ -145,14 +209,14 @@ impl<T: Transport> RaftNode<T> {
     fn broadcast(&mut self, msg: Message) {
         for &address in &self.nodes {
             if address != self.id {
-                self.send_message(address, msg);
+                self.send_message(address, msg.clone());
             }
         }
     }
 
-    fn majority_count(&self) -> u32 {
-        let c = (self.nodes.len() as f64 / 2.0).ceil() as u32;
-        eprintln!("majority count: {}", c);
+    fn majority_count(&self) -> usize {
+        let c = (self.nodes.len() as f64 / 2.0).ceil() as usize;
+        // eprintln!("majority count: {}", c);
         c
     }
 
@@ -199,7 +263,11 @@ impl<T: Transport> RaftNode<T> {
                     }
                 }
             }
-            Message::AppendEntries { term } => {
+            Message::AppendEntries {
+                term,
+                entries,
+                committed_seq,
+            } => {
                 if term < self.term.seq {
                     debug!(
                         "{}: Ignoring AE with term below the current: {} < {}",
@@ -227,6 +295,67 @@ impl<T: Transport> RaftNode<T> {
                     self.start_term(term);
                     self.become_follower(Some(from));
                 }
+
+                let majority_count = self.majority_count();
+                let lh = self.lh();
+                if let NodeState::Leader(state) = &mut self.state {
+                    eprintln!(
+                        "last_append_seq = {}, committed_seq = {}",
+                        state.last_append_seq, committed_seq
+                    );
+                    if state.last_append_seq as u64 == committed_seq {
+                        state.current_acks += 1;
+                        if state.current_acks >= majority_count {
+                            debug!("{}: seq {} got majority acks", lh, state.last_append_seq);
+                            self.log.commit(state.last_append_seq as u64);
+                            let entry = self.log.entries
+                                [(state.last_append_seq as u64 - self.log.base_seq) as usize];
+                            self.value = entry.op.apply(self.value);
+                        }
+                    }
+                } else {
+                    let log = &mut self.log;
+
+                    if log.next_seq != committed_seq {
+                        debug!(
+                            "Currently seq doens't match with expected base_seq: {} != {}",
+                            log.next_seq, committed_seq
+                        );
+                        // TODO: need to restore
+                        panic!("need to restore logs");
+                    }
+
+                    let has_new_entries = !entries.is_empty();
+
+                    for entry in entries {
+                        debug!("{}: appending entry in follower: {:?}", self.lh(), entry);
+                        self.log.push(entry);
+                    }
+
+                    for seq in self.log.committed_seq..committed_seq {
+                        let log = &mut self.log;
+                        let entry = log.entries[(seq - log.base_seq) as usize];
+                        self.value = entry.op.apply(self.value);
+                        log.commit(seq);
+                        debug!(
+                            "{}: Apply commit {} to value, becomes {}",
+                            self.lh(),
+                            seq,
+                            self.value,
+                        );
+                    }
+
+                    if has_new_entries {
+                        self.send_message(
+                            from,
+                            Message::AppendEntries {
+                                term: self.term.seq,
+                                entries: vec![],
+                                committed_seq: self.log.next_seq - 1,
+                            },
+                        );
+                    }
+                }
             }
             Message::ShowStatus => {
                 let status = NodeStatus {
@@ -238,10 +367,23 @@ impl<T: Transport> RaftNode<T> {
                         NodeState::Candidate(st) => st.timeout_at - Instant::now(),
                         NodeState::Leader(_) => Duration::from_millis(0),
                     },
+                    value: self.value,
                 };
                 self.send_message(from, Message::Status(status));
             }
             Message::Status(_) => {
+                // ignore
+            }
+            Message::UpdateValue(op) => {
+                if let NodeState::Leader(_) = &mut self.state {
+                    self.log.append(op);
+                    // TODO: not at this timining
+                    self.send_message(from, Message::UpdateValueResult(None))
+                } else {
+                    self.send_message(from, Message::UpdateValueResult(Some("not the leader")))
+                }
+            }
+            Message::UpdateValueResult(_) => {
                 // ignore
             }
         }
@@ -288,9 +430,16 @@ impl<T: Transport> RaftNode<T> {
 
     fn send_heartbeat(&mut self) {
         // self.log_state("Sending heartbeats");
-        self.broadcast(Message::AppendEntries {
+        if let NodeState::Leader(state) = &mut self.state {
+            state.last_append_seq = self.log.next_seq as i64 - 1;
+            state.current_acks = 0;
+        }
+        let msg = Message::AppendEntries {
             term: self.term.seq,
-        });
+            entries: self.log.uncommitted_entries(),
+            committed_seq: self.log.committed_seq,
+        };
+        self.broadcast(msg);
     }
 
     fn scheduled_work(&mut self) -> Instant {
@@ -338,6 +487,23 @@ impl<T: Transport> RaftNode<T> {
                 },
             }
             next_timeout = self.scheduled_work();
+        }
+    }
+}
+
+pub mod ops {
+    #[derive(Clone, Copy, Debug)]
+    pub enum Operation {
+        Set(i32),
+        Increment(i32),
+    }
+
+    impl Operation {
+        pub fn apply(&self, value: i32) -> i32 {
+            match *self {
+                Operation::Set(val) => val,
+                Operation::Increment(to_add) => value + to_add,
+            }
         }
     }
 }

@@ -35,6 +35,29 @@ fn main() {
                 "set" => {
                     // set 5 10 <= set 10 through node 5
                     // set value
+                    if cmd.len() != 3 {
+                        eprintln!("usage: set NODE VALUE");
+                        continue;
+                    }
+                    let node: u32 = cmd[1].parse().unwrap();
+                    let value: i32 = cmd[2].parse().unwrap();
+                    transport.lock().unwrap().send(
+                        0,
+                        node,
+                        node::Message::UpdateValue(node::ops::Operation::Set(value)),
+                    );
+                    let (from, msg) = super_rx.recv().unwrap();
+                    if from != node {
+                        panic!("???");
+                    }
+                    if let node::Message::UpdateValueResult(err) = msg {
+                        match err {
+                            Some(msg) => eprintln!("ERROR: {}", msg),
+                            None => eprintln!("OK"),
+                        }
+                    } else {
+                        eprintln!("unexpected message received: {:?}", msg);
+                    }
                 }
                 "down" => {
                     let mut tp = transport.lock().unwrap();
@@ -72,12 +95,13 @@ fn main() {
                     for (i, status) in stats.iter().enumerate() {
                         let status = status.unwrap();
                         eprintln!(
-                            "{}[{}] Term:{}, Leader:{}, ETO:{}",
+                            "{}[{}] Term:{}, Leader:{}, ETO:{}, Value:{}",
                             i + 1,
                             status.state,
                             status.term,
                             status.leader,
                             status.election_timeout.as_secs(),
+                            status.value,
                         );
                     }
                 }
