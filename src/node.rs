@@ -29,6 +29,7 @@ impl Term {
 #[derive(Debug, Clone, Copy)]
 pub struct LogEntry {
     seq: u64,
+    term: u64,
     op: ops::Operation,
 }
 
@@ -49,8 +50,9 @@ impl Log {
         }
     }
 
-    fn append(&mut self, op: ops::Operation) {
+    fn append(&mut self, term: u64, op: ops::Operation) {
         self.push(LogEntry {
+            term,
             seq: self.next_seq,
             op,
         });
@@ -65,12 +67,31 @@ impl Log {
         self.committed_seq = seq + 1;
     }
 
+    fn reset(&mut self, entries: Vec<LogEntry>) {
+        self.entries = entries;
+        self.base_seq = self.entries.first().map(|e| e.seq).unwrap_or(0);
+        self.next_seq = self.entries.last().map(|e| e.seq + 1).unwrap_or(0);
+        self.committed_seq = self.base_seq;
+    }
+
     fn uncommitted_entries(&self) -> Vec<LogEntry> {
         let first = (self.committed_seq - self.base_seq) as usize;
         if self.entries.len() > first {
             self.entries[first..].to_vec()
         } else {
             vec![]
+        }
+    }
+
+    fn last_committed_id(&self) -> LogId {
+        if self.committed_seq > 0 {
+            let entry = self.entries[self.committed_seq as usize - 1];
+            LogId {
+                term: entry.term,
+                seq: entry.seq,
+            }
+        } else {
+            LogId { term: 0, seq: 0 }
         }
     }
 }
@@ -163,17 +184,27 @@ pub struct NodeStatus {
     pub value: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LogId {
+    term: u64,
+    seq: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     RequestVote {
         term: u64,
+        last_log_id: LogId,
     },
     Vote,
     AppendEntries {
         term: u64,
         entries: Vec<LogEntry>,
         committed_seq: u64,
+        full_sync: bool,
     },
+
+    RequestFullSync,
 
     UpdateValue(ops::Operation),
     UpdateValueResult(Option<&'static str>),
@@ -234,7 +265,18 @@ impl<T: Transport> RaftNode<T> {
 
     pub fn recv(&mut self, from: u32, msg: Message) {
         match msg {
-            Message::RequestVote { term } => {
+            Message::RequestVote { term, last_log_id } => {
+                if self.log.last_committed_id() > last_log_id {
+                    debug!(
+                        "{}: Not voting for {} because it has lower last log ID than mine: {:?} < {:?}",
+                        self.lh(),
+                        from,
+                        last_log_id,
+                        self.log.last_committed_id()
+                    );
+                    self.become_candidate();
+                    return;
+                }
                 if self.term.seq < term {
                     self.start_term(term);
                     debug!(
@@ -267,6 +309,7 @@ impl<T: Transport> RaftNode<T> {
                 term,
                 entries,
                 committed_seq,
+                full_sync,
             } => {
                 if term < self.term.seq {
                     debug!(
@@ -299,10 +342,6 @@ impl<T: Transport> RaftNode<T> {
                 let majority_count = self.majority_count();
                 let lh = self.lh();
                 if let NodeState::Leader(state) = &mut self.state {
-                    eprintln!(
-                        "last_append_seq = {}, committed_seq = {}",
-                        state.last_append_seq, committed_seq
-                    );
                     if state.last_append_seq as u64 == committed_seq {
                         state.current_acks += 1;
                         if state.current_acks >= majority_count {
@@ -314,22 +353,29 @@ impl<T: Transport> RaftNode<T> {
                         }
                     }
                 } else {
-                    let log = &mut self.log;
-
-                    if log.next_seq != committed_seq {
+                    if self.log.next_seq != committed_seq && !full_sync {
+                        // TODO: rewind log if I'm in advansed state than the leader
+                        // ** handle of rollback
                         debug!(
-                            "Currently seq doens't match with expected base_seq: {} != {}",
-                            log.next_seq, committed_seq
+                            "{}: Currently seq doesn't match with expected base_seq: {} != {}",
+                            self.lh(),
+                            self.log.next_seq,
+                            committed_seq
                         );
-                        // TODO: need to restore
-                        panic!("need to restore logs");
+                        self.send_message(from, Message::RequestFullSync);
+                        return;
                     }
 
                     let has_new_entries = !entries.is_empty();
-
-                    for entry in entries {
-                        debug!("{}: appending entry in follower: {:?}", self.lh(), entry);
-                        self.log.push(entry);
+                    if full_sync {
+                        eprintln!("{}: Reset log entries to {:?}", self.lh(), entries);
+                        self.log.reset(entries);
+                        return;
+                    } else {
+                        for entry in entries {
+                            debug!("{}: appending entry in follower: {:?}", self.lh(), entry);
+                            self.log.push(entry);
+                        }
                     }
 
                     for seq in self.log.committed_seq..committed_seq {
@@ -352,6 +398,7 @@ impl<T: Transport> RaftNode<T> {
                                 term: self.term.seq,
                                 entries: vec![],
                                 committed_seq: self.log.next_seq - 1,
+                                full_sync: false,
                             },
                         );
                     }
@@ -375,8 +422,8 @@ impl<T: Transport> RaftNode<T> {
                 // ignore
             }
             Message::UpdateValue(op) => {
-                if let NodeState::Leader(_) = &mut self.state {
-                    self.log.append(op);
+                if let NodeState::Leader(_) = self.state {
+                    self.log.append(self.term.seq, op);
                     // TODO: not at this timining
                     self.send_message(from, Message::UpdateValueResult(None))
                 } else {
@@ -385,6 +432,19 @@ impl<T: Transport> RaftNode<T> {
             }
             Message::UpdateValueResult(_) => {
                 // ignore
+            }
+            Message::RequestFullSync => {
+                if let NodeState::Leader(_) = self.state {
+                    self.send_message(
+                        from,
+                        Message::AppendEntries {
+                            term: self.term.seq,
+                            entries: self.log.entries.clone(),
+                            committed_seq: self.log.committed_seq,
+                            full_sync: true,
+                        },
+                    );
+                }
             }
         }
     }
@@ -413,6 +473,7 @@ impl<T: Transport> RaftNode<T> {
         self.state = NodeState::Candidate(state);
         self.broadcast(Message::RequestVote {
             term: self.term.seq,
+            last_log_id: self.log.last_committed_id(),
         });
     }
 
@@ -432,12 +493,13 @@ impl<T: Transport> RaftNode<T> {
         // self.log_state("Sending heartbeats");
         if let NodeState::Leader(state) = &mut self.state {
             state.last_append_seq = self.log.next_seq as i64 - 1;
-            state.current_acks = 0;
+            state.current_acks = 1;
         }
         let msg = Message::AppendEntries {
             term: self.term.seq,
             entries: self.log.uncommitted_entries(),
             committed_seq: self.log.committed_seq,
+            full_sync: false,
         };
         self.broadcast(msg);
     }
