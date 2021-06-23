@@ -1,4 +1,5 @@
 use std::io::{self, BufRead};
+mod log;
 mod node;
 mod transport;
 use env_logger;
@@ -92,7 +93,7 @@ fn main() {
                             msg => eprintln!("Unexpected message received: {:?}", msg),
                         }
                     }
-                    for (i, status) in stats.iter().enumerate() {
+                    for (i, status) in stats.into_iter().enumerate() {
                         let status = status.unwrap();
                         eprintln!(
                             "{}[{}] Term:{}, Leader:{}, ETO:{}, Value:{}",

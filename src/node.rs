@@ -1,5 +1,7 @@
+use crate::log::{self as rlog, EntryId};
 use log::{debug, info};
 use rand::Rng;
+use std::fmt;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,81 +19,57 @@ pub trait Transport {
 #[derive(Clone, Copy)]
 struct Term {
     seq: u64,
-    voted: bool,
+    voted_for: Option<u32>,
 }
 
 impl Term {
     fn new(seq: u64) -> Self {
-        Self { seq, voted: false }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct LogEntry {
-    seq: u64,
-    term: u64,
-    op: ops::Operation,
-}
-
-struct Log {
-    entries: Vec<LogEntry>,
-    base_seq: u64,
-    next_seq: u64,
-    committed_seq: u64,
-}
-
-impl Log {
-    fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            base_seq: 0,
-            next_seq: 0,
-            committed_seq: 0,
+            seq,
+            voted_for: None,
+        }
+    }
+}
+
+pub struct LeaderState {
+    next_append_at: Instant,
+    replica_states: Vec<ReplicaState>,
+}
+
+impl LeaderState {
+    pub fn new(num_nodes: usize, log: &rlog::Log) -> Self {
+        Self {
+            next_append_at: Instant::now() + HEARTBEAT_TIMEOUT,
+            replica_states: vec![ReplicaState::new(log); num_nodes],
         }
     }
 
-    fn append(&mut self, term: u64, op: ops::Operation) {
-        self.push(LogEntry {
-            term,
-            seq: self.next_seq,
-            op,
-        });
+    fn index_high_watermark(&self, majority: usize) -> usize {
+        let mut indexes: Vec<_> = self.replica_states.iter().map(|s| s.match_index).collect();
+        indexes.sort();
+        indexes[indexes.len() - majority]
     }
 
-    fn push(&mut self, entry: LogEntry) {
-        self.entries.push(entry);
-        self.next_seq = entry.seq + 1;
+    fn replica_state(&self, id: u32) -> &ReplicaState {
+        &self.replica_states[id as usize - 1]
     }
 
-    fn commit(&mut self, seq: u64) {
-        self.committed_seq = seq + 1;
+    fn replica_state_mut(&mut self, id: u32) -> &mut ReplicaState {
+        &mut self.replica_states[id as usize - 1]
     }
+}
 
-    fn reset(&mut self, entries: Vec<LogEntry>) {
-        self.entries = entries;
-        self.base_seq = self.entries.first().map(|e| e.seq).unwrap_or(0);
-        self.next_seq = self.entries.last().map(|e| e.seq + 1).unwrap_or(0);
-        self.committed_seq = self.base_seq;
-    }
+#[derive(Debug, Clone)]
+struct ReplicaState {
+    next_index: usize, // leader's last log index + 1
+    match_index: usize,
+}
 
-    fn uncommitted_entries(&self) -> Vec<LogEntry> {
-        let first = (self.committed_seq - self.base_seq) as usize;
-        if self.entries.len() > first {
-            self.entries[first..].to_vec()
-        } else {
-            vec![]
-        }
-    }
-
-    fn last_committed_id(&self) -> LogId {
-        if self.committed_seq > 0 {
-            let entry = self.entries[self.committed_seq as usize - 1];
-            LogId {
-                term: entry.term,
-                seq: entry.seq,
-            }
-        } else {
-            LogId { term: 0, seq: 0 }
+impl ReplicaState {
+    fn new(log: &rlog::Log) -> Self {
+        Self {
+            next_index: log.last_index() + 1,
+            match_index: 0,
         }
     }
 }
@@ -103,7 +81,7 @@ pub struct RaftNode<T: Transport> {
     nodes: Vec<u32>,
     state: NodeState,
     value: i32,
-    log: Log,
+    log: rlog::Log,
 }
 
 fn next_election_timeout() -> Duration {
@@ -140,21 +118,15 @@ impl FollowerState {
             leader,
         }
     }
-}
 
-pub struct LeaderState {
-    next_append_at: Instant,
-    last_append_seq: i64,
-    current_acks: usize,
-}
-
-impl LeaderState {
-    pub fn new() -> Self {
-        Self {
-            next_append_at: Instant::now() + HEARTBEAT_TIMEOUT,
-            last_append_seq: -1,
-            current_acks: 0,
+    fn extend_election_timeout(&mut self, from: u32) {
+        // TODO: should check current leader?
+        if self.leader.is_none() {
+            self.leader = Some(from);
         }
+
+        let timeout = next_election_timeout();
+        self.next_election_at = Instant::now() + timeout;
     }
 }
 
@@ -162,6 +134,21 @@ pub enum NodeState {
     Follower(FollowerState),
     Candidate(CandidateState),
     Leader(LeaderState),
+}
+
+impl fmt::Display for NodeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use NodeState::*;
+        write!(
+            f,
+            "{}",
+            match self {
+                Follower(_) => "follower",
+                Candidate(_) => "candidate",
+                Leader(_) => "leader",
+            }
+        )
+    }
 }
 
 impl NodeState {
@@ -175,36 +162,39 @@ impl NodeState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct NodeStatus {
-    pub state: &'static str,
+    pub state: String,
     pub leader: i32,
     pub term: u64,
     pub election_timeout: Duration,
     pub value: i32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LogId {
-    term: u64,
-    seq: u64,
-}
-
 #[derive(Clone, Debug)]
 pub enum Message {
     RequestVote {
         term: u64,
-        last_log_id: LogId,
+        last_log_index: usize,
+        last_log_term: u64,
     },
-    Vote,
+    RequestVoteResponse {
+        term: u64,
+        vote_granted: bool,
+    },
     AppendEntries {
         term: u64,
-        entries: Vec<LogEntry>,
-        committed_seq: u64,
-        full_sync: bool,
+        leader_id: u32,
+        prev_log_index: usize,
+        prev_log_term: u64,
+        entries: Vec<rlog::LogEntry>,
+        leader_commit: usize,
     },
-
-    RequestFullSync,
+    AppendEntriesResponse {
+        term: u64,
+        success: bool,
+        last_append_index: usize,
+    },
 
     UpdateValue(ops::Operation),
     UpdateValueResult(Option<&'static str>),
@@ -221,20 +211,177 @@ impl<T: Transport> RaftNode<T> {
             transport,
             state: NodeState::Follower(FollowerState::new(None)),
             value: 0,
-            log: Log::new(),
+            log: rlog::Log::new(),
         }
     }
 
-    fn state_str(&self) -> &'static str {
-        match &self.state {
-            NodeState::Follower(_) => "follower",
-            NodeState::Candidate(_) => "candidate",
-            NodeState::Leader(_) => "leader",
-        }
+    fn send_message(&self, to: u32, msg: Message) {
+        self.transport.lock().unwrap().send(self.id, to, msg);
     }
 
-    pub fn set_value(&mut self, value: i32) {
-        self.value = value;
+    fn send_vote_rejection(&self, from: u32) {
+        self.send_message(
+            from,
+            Message::RequestVoteResponse {
+                term: self.term.seq,
+                vote_granted: false,
+            },
+        );
+    }
+
+    fn handle_request_vote(
+        &mut self,
+        from: u32,
+        term: u64,
+        last_log_index: usize,
+        last_log_term: u64,
+    ) {
+        if term < self.term.seq {
+            // Do not vote if candidate's term is below mine.
+            debug!(
+                "{}: Not voting for {} because it has lower term than mine: {} < {}",
+                self.lh(),
+                from,
+                term,
+                self.term.seq,
+            );
+            self.send_vote_rejection(from);
+            return;
+        }
+        if self.term.seq < term {
+            // If this candidate has higher term, we should start a new term before any further checks.
+            self.start_term(term);
+            debug!(
+                "{}: Starting new term and becoming follower {} by RequestVote from {}",
+                self.lh(),
+                self.term.seq,
+                from
+            );
+            self.become_follower(None);
+        }
+
+        let last_entry_id = EntryId {
+            index: last_log_index,
+            term: last_log_term,
+        };
+        // 5.4.1 Election restriction
+        if last_entry_id < self.log.last_entry_id() {
+            // Do not vote if candidate's term is below mine.
+            debug!(
+                "{}: Not voting for {} because it has lower last log ID than mine: {:?} < {:?}",
+                self.lh(),
+                from,
+                last_entry_id,
+                self.log.last_entry_id(),
+            );
+            self.send_vote_rejection(from);
+            return;
+        }
+
+        if let Some(voted_for) = self.term.voted_for {
+            if voted_for != from {
+                // Do not vote if I've already voted for an another candidate
+                self.send_vote_rejection(from);
+                return;
+            }
+        }
+
+        self.term.voted_for = Some(from);
+        self.send_message(
+            from,
+            Message::RequestVoteResponse {
+                term: self.term.seq,
+                vote_granted: true,
+            },
+        );
+        self.become_follower(None);
+    }
+
+    fn send_ae_rejection(&mut self, from: u32) {
+        self.send_message(
+            from,
+            Message::AppendEntriesResponse {
+                term: self.term.seq,
+                success: false,
+                last_append_index: 0,
+            },
+        );
+    }
+
+    fn handle_append_entries(
+        &mut self,
+        from: u32,
+        term: u64,
+        leader_id: u32,
+        prev_log_index: usize,
+        prev_log_term: u64,
+        entries: Vec<rlog::LogEntry>,
+        leader_commit: usize,
+    ) {
+        if term < self.term.seq {
+            debug!(
+                "{}: Ignoring AE with term below the current: {} < {}",
+                self.lh(),
+                term,
+                self.term.seq
+            );
+            self.send_ae_rejection(from);
+            return;
+        }
+
+        if let NodeState::Follower(state) = &mut self.state {
+            state.extend_election_timeout(from);
+        } else if term > self.term.seq {
+            // If now leader or candidate and receive bigger term, we should start following the new leader
+            debug!(
+                "{}: Received bigger term, start following {} as new leader",
+                self.lh(),
+                from
+            );
+            self.start_term(term);
+            self.become_follower(Some(from));
+        }
+
+        if prev_log_index > 0 {
+            if let Some(entry) = self.log.get(prev_log_index) {
+                if entry.term != prev_log_term {
+                    // Conflict
+                    self.log.truncate_to(prev_log_index);
+                }
+            } else {
+                debug!(
+                    "{}: Log entry {} does not exists, fail to process AppendEntries from {}",
+                    self.lh(),
+                    prev_log_index,
+                    from
+                );
+                self.send_ae_rejection(from);
+                return;
+            }
+        }
+
+        for (i, entry) in entries.into_iter().enumerate() {
+            let index = prev_log_index + i + 1;
+            if index <= self.log.last_index() {
+                // Dedup. 5.5 Follower and candidate crashes
+                continue;
+            }
+            debug!("{}: appending entry in follower: {:?}", self.lh(), entry);
+            self.log.append(entry);
+        }
+
+        if leader_commit > self.log.committed_index() {
+            self.value = self.log.commit(leader_commit, self.value);
+        }
+
+        self.send_message(
+            from,
+            Message::AppendEntriesResponse {
+                term: self.term.seq,
+                success: true,
+                last_append_index: self.log.last_index(),
+            },
+        );
     }
 
     fn broadcast(&mut self, msg: Message) {
@@ -246,9 +393,7 @@ impl<T: Transport> RaftNode<T> {
     }
 
     fn majority_count(&self) -> usize {
-        let c = (self.nodes.len() as f64 / 2.0).ceil() as usize;
-        // eprintln!("majority count: {}", c);
-        c
+        (self.nodes.len() as f64 / 2.0).ceil() as usize
     }
 
     fn start_term(&mut self, term: u64) {
@@ -259,45 +404,22 @@ impl<T: Transport> RaftNode<T> {
         self.term = Term::new(self.term.seq + 1);
     }
 
-    fn send_message(&self, to: u32, msg: Message) {
-        self.transport.lock().unwrap().send(self.id, to, msg);
-    }
-
     pub fn recv(&mut self, from: u32, msg: Message) {
         match msg {
-            Message::RequestVote { term, last_log_id } => {
-                if self.log.last_committed_id() > last_log_id {
-                    debug!(
-                        "{}: Not voting for {} because it has lower last log ID than mine: {:?} < {:?}",
-                        self.lh(),
-                        from,
-                        last_log_id,
-                        self.log.last_committed_id()
-                    );
-                    self.become_candidate();
+            Message::RequestVote {
+                term,
+                last_log_index,
+                last_log_term,
+            } => {
+                self.handle_request_vote(from, term, last_log_index, last_log_term);
+            }
+            Message::RequestVoteResponse { term, vote_granted } => {
+                if term != self.term.seq {
                     return;
                 }
-                if self.term.seq < term {
-                    self.start_term(term);
-                    debug!(
-                        "{}: Starting new term {} by RequestVote from {}",
-                        self.lh(),
-                        self.term.seq,
-                        from
-                    );
+                if !vote_granted {
+                    return;
                 }
-                if !self.term.voted {
-                    debug!(
-                        "{}: Voting to {} for term {}",
-                        self.lh(),
-                        from,
-                        self.term.seq
-                    );
-                    self.send_message(from, Message::Vote);
-                    self.become_follower(None)
-                }
-            }
-            Message::Vote => {
                 if let NodeState::Candidate(state) = &mut self.state {
                     state.vote_count += 1;
                     if state.vote_count >= self.majority_count() {
@@ -307,106 +429,69 @@ impl<T: Transport> RaftNode<T> {
             }
             Message::AppendEntries {
                 term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
                 entries,
-                committed_seq,
-                full_sync,
+                leader_commit,
             } => {
-                if term < self.term.seq {
-                    debug!(
-                        "{}: Ignoring AE with term below the current: {} < {}",
-                        self.lh(),
-                        term,
-                        self.term.seq
-                    );
-                    return;
-                }
-
-                if let NodeState::Follower(state) = &mut self.state {
-                    if state.leader.is_none() {
-                        self.become_follower(Some(from));
-                    } else {
-                        let timeout = next_election_timeout();
-                        state.next_election_at = Instant::now() + timeout;
-                    }
-                } else if term > self.term.seq {
-                    // If now leader or candidate and receive bigger term, we should start following the new leader
-                    debug!(
-                        "{}: Received bigger term, start following {} as new leader",
-                        self.lh(),
-                        from
-                    );
-                    self.start_term(term);
-                    self.become_follower(Some(from));
-                }
-
+                self.handle_append_entries(
+                    from,
+                    term,
+                    leader_id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                );
+            }
+            Message::AppendEntriesResponse {
+                term,
+                success,
+                last_append_index,
+            } => {
+                // TODO: should check term also?
                 let majority_count = self.majority_count();
                 let lh = self.lh();
-                if let NodeState::Leader(state) = &mut self.state {
-                    if state.last_append_seq as u64 == committed_seq {
-                        state.current_acks += 1;
-                        if state.current_acks >= majority_count {
-                            debug!("{}: seq {} got majority acks", lh, state.last_append_seq);
-                            self.log.commit(state.last_append_seq as u64);
-                            let entry = self.log.entries
-                                [(state.last_append_seq as u64 - self.log.base_seq) as usize];
-                            self.value = entry.op.apply(self.value);
+                if success {
+                    if let NodeState::Leader(state) = &mut self.state {
+                        let replica_state = state.replica_state_mut(from);
+                        if replica_state.next_index != last_append_index + 1 {
+                            debug!(
+                            "{}: Updating replica state [{}], next_index = {}, match_index = {}",
+                            lh,
+                            from,
+                            last_append_index + 1,
+                            last_append_index
+                        );
                         }
+                        replica_state.next_index = last_append_index + 1;
+                        replica_state.match_index = last_append_index;
+
+                        let hw = state.index_high_watermark(majority_count);
+                        self.value = self.log.commit(hw, self.value);
                     }
                 } else {
-                    if self.log.next_seq != committed_seq && !full_sync {
-                        // TODO: rewind log if I'm in advansed state than the leader
-                        // ** handle of rollback
-                        debug!(
-                            "{}: Currently seq doesn't match with expected base_seq: {} != {}",
-                            self.lh(),
-                            self.log.next_seq,
-                            committed_seq
-                        );
-                        self.send_message(from, Message::RequestFullSync);
-                        return;
-                    }
-
-                    let has_new_entries = !entries.is_empty();
-                    if full_sync {
-                        eprintln!("{}: Reset log entries to {:?}", self.lh(), entries);
-                        self.log.reset(entries);
-                        return;
+                    if term > self.term.seq {
+                        self.start_term(term);
+                        self.become_follower(None);
                     } else {
-                        for entry in entries {
-                            debug!("{}: appending entry in follower: {:?}", self.lh(), entry);
-                            self.log.push(entry);
+                        // If the follower rejected because of absent prev_log_index, decrement next_index
+                        // and retry.
+                        // 5.3 Log replication
+                        if let NodeState::Leader(state) = &mut self.state {
+                            let replica_state = state.replica_state_mut(from);
+                            replica_state.next_index -= 1;
                         }
-                    }
-
-                    for seq in self.log.committed_seq..committed_seq {
-                        let log = &mut self.log;
-                        let entry = log.entries[(seq - log.base_seq) as usize];
-                        self.value = entry.op.apply(self.value);
-                        log.commit(seq);
-                        debug!(
-                            "{}: Apply commit {} to value, becomes {}",
-                            self.lh(),
-                            seq,
-                            self.value,
-                        );
-                    }
-
-                    if has_new_entries {
-                        self.send_message(
-                            from,
-                            Message::AppendEntries {
-                                term: self.term.seq,
-                                entries: vec![],
-                                committed_seq: self.log.next_seq - 1,
-                                full_sync: false,
-                            },
-                        );
+                        if let NodeState::Leader(state) = &self.state {
+                            self.send_heartbeat(from, state);
+                        }
                     }
                 }
             }
             Message::ShowStatus => {
                 let status = NodeStatus {
-                    state: self.state_str(),
+                    state: self.state.to_string(),
                     leader: self.current_leader(),
                     term: self.term.seq,
                     election_timeout: match &self.state {
@@ -422,8 +507,15 @@ impl<T: Transport> RaftNode<T> {
                 // ignore
             }
             Message::UpdateValue(op) => {
-                if let NodeState::Leader(_) = self.state {
-                    self.log.append(self.term.seq, op);
+                if let NodeState::Leader(state) = &mut self.state {
+                    self.log.append(rlog::LogEntry {
+                        term: self.term.seq,
+                        op,
+                    });
+                    let replica_state = state.replica_state_mut(self.id);
+                    replica_state.next_index = self.log.last_index() + 1;
+                    replica_state.match_index = self.log.last_index();
+
                     // TODO: not at this timining
                     self.send_message(from, Message::UpdateValueResult(None))
                 } else {
@@ -432,19 +524,6 @@ impl<T: Transport> RaftNode<T> {
             }
             Message::UpdateValueResult(_) => {
                 // ignore
-            }
-            Message::RequestFullSync => {
-                if let NodeState::Leader(_) = self.state {
-                    self.send_message(
-                        from,
-                        Message::AppendEntries {
-                            term: self.term.seq,
-                            entries: self.log.entries.clone(),
-                            committed_seq: self.log.committed_seq,
-                            full_sync: true,
-                        },
-                    );
-                }
             }
         }
     }
@@ -458,7 +537,7 @@ impl<T: Transport> RaftNode<T> {
     }
 
     fn lh(&self) -> String {
-        format!("{}[{}]", self.id, self.state_str())
+        format!("{}[{}]", self.id, self.state.to_string())
     }
 
     fn become_candidate(&mut self) {
@@ -471,9 +550,11 @@ impl<T: Transport> RaftNode<T> {
         let mut state = CandidateState::new();
         state.vote_count += 1;
         self.state = NodeState::Candidate(state);
+        let last = self.log.last_entry_id();
         self.broadcast(Message::RequestVote {
             term: self.term.seq,
-            last_log_id: self.log.last_committed_id(),
+            last_log_index: last.index,
+            last_log_term: last.term,
         });
     }
 
@@ -485,23 +566,39 @@ impl<T: Transport> RaftNode<T> {
 
     fn become_leader(&mut self) {
         debug!("{}: become LEADER", self.lh());
-        let state = LeaderState::new();
+        let state = LeaderState::new(self.nodes.len(), &self.log);
         self.state = NodeState::Leader(state);
     }
 
-    fn send_heartbeat(&mut self) {
-        // self.log_state("Sending heartbeats");
-        if let NodeState::Leader(state) = &mut self.state {
-            state.last_append_seq = self.log.next_seq as i64 - 1;
-            state.current_acks = 1;
-        }
+    fn send_heartbeat(&self, id: u32, state: &LeaderState) {
+        let replica_state = state.replica_state(id);
+        let entries = self.log.entries_from(replica_state.next_index).to_vec();
+
+        let prev = self.log.entry_id_at(replica_state.next_index - 1);
         let msg = Message::AppendEntries {
             term: self.term.seq,
-            entries: self.log.uncommitted_entries(),
-            committed_seq: self.log.committed_seq,
-            full_sync: false,
+            leader_id: self.id,
+            prev_log_index: prev.index,
+            prev_log_term: prev.term,
+            entries,
+            leader_commit: self.log.committed_index(),
         };
-        self.broadcast(msg);
+        self.send_message(id, msg);
+    }
+
+    fn send_heartbeats(&mut self) {
+        // self.log_state("Sending heartbeats");
+        if let NodeState::Leader(state) = &self.state {
+            for &id in &self.nodes {
+                if id == self.id {
+                    continue;
+                }
+                self.send_heartbeat(id, state);
+            }
+        }
+        if let NodeState::Leader(state) = &mut self.state {
+            state.next_append_at = Instant::now() + HEARTBEAT_TIMEOUT;
+        }
     }
 
     fn scheduled_work(&mut self) -> Instant {
@@ -522,7 +619,7 @@ impl<T: Transport> RaftNode<T> {
                 let now = Instant::now();
                 if now >= state.next_append_at {
                     state.next_append_at = now + HEARTBEAT_TIMEOUT;
-                    self.send_heartbeat();
+                    self.send_heartbeats();
                 }
             }
         }
