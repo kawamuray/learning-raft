@@ -1,4 +1,6 @@
 use std::io::{self, BufRead};
+#[cfg(test)]
+mod it;
 mod log;
 mod node;
 mod transport;

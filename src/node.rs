@@ -6,11 +6,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // must be smaller than election timeout min
-const ELECTION_TIMEOUT_MIN: Duration = Duration::from_secs(5);
-const ELECTION_TIMEOUT_MAX: Duration = Duration::from_secs(10);
+pub const ELECTION_TIMEOUT_MIN: Duration = Duration::from_secs(5);
+pub const ELECTION_TIMEOUT_MAX: Duration = Duration::from_secs(10);
 // const ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(150);
 // const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(300);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub trait Transport {
     fn send(&mut self, from: u32, to: u32, msg: Message);
@@ -82,14 +82,8 @@ pub struct RaftNode<T: Transport> {
     state: NodeState,
     value: i32,
     log: rlog::Log,
-}
-
-fn next_election_timeout() -> Duration {
-    let mut rng = rand::thread_rng();
-    let timeout = rng.gen_range(
-        ELECTION_TIMEOUT_MIN.as_millis() as u64..ELECTION_TIMEOUT_MAX.as_millis() as u64,
-    );
-    Duration::from_millis(timeout)
+    election_timeout_min: Duration,
+    election_timeout_max: Duration,
 }
 
 pub struct CandidateState {
@@ -98,9 +92,9 @@ pub struct CandidateState {
 }
 
 impl CandidateState {
-    pub fn new() -> Self {
+    pub fn new(election_timeout: Duration) -> Self {
         Self {
-            timeout_at: Instant::now() + next_election_timeout(),
+            timeout_at: Instant::now() + election_timeout,
             vote_count: 0,
         }
     }
@@ -112,20 +106,19 @@ pub struct FollowerState {
 }
 
 impl FollowerState {
-    pub fn new(leader: Option<u32>) -> Self {
+    pub fn new(leader: Option<u32>, election_timeout: Duration) -> Self {
         Self {
-            next_election_at: Instant::now() + next_election_timeout(),
+            next_election_at: Instant::now() + election_timeout,
             leader,
         }
     }
 
-    fn extend_election_timeout(&mut self, from: u32) {
+    fn extend_election_timeout(&mut self, from: u32, timeout: Duration) {
         // TODO: should check current leader?
         if self.leader.is_none() {
             self.leader = Some(from);
         }
 
-        let timeout = next_election_timeout();
         self.next_election_at = Instant::now() + timeout;
     }
 }
@@ -204,15 +197,34 @@ pub enum Message {
 
 impl<T: Transport> RaftNode<T> {
     pub fn new(id: u32, nodes: Vec<u32>, transport: Arc<Mutex<T>>) -> Self {
-        Self {
+        let mut this = Self {
             id,
             term: Term::new(0),
             nodes,
             transport,
-            state: NodeState::Follower(FollowerState::new(None)),
+            state: NodeState::Follower(FollowerState::new(None, Duration::from_secs(0))),
             value: 0,
             log: rlog::Log::new(),
-        }
+            election_timeout_min: ELECTION_TIMEOUT_MIN,
+            election_timeout_max: ELECTION_TIMEOUT_MAX,
+        };
+        this.become_follower(None);
+        this
+    }
+
+    pub fn set_election_timeout(&mut self, min: Duration, max: Duration) {
+        self.election_timeout_min = min;
+        self.election_timeout_max = max;
+        self.become_follower(None);
+    }
+
+    fn next_election_timeout(&self) -> Duration {
+        let mut rng = rand::thread_rng();
+        let timeout = rng.gen_range(
+            self.election_timeout_min.as_millis() as u64
+                ..self.election_timeout_max.as_millis() as u64,
+        );
+        Duration::from_millis(timeout)
     }
 
     fn send_message(&self, to: u32, msg: Message) {
@@ -329,8 +341,9 @@ impl<T: Transport> RaftNode<T> {
             return;
         }
 
+        let election_to = self.next_election_timeout();
         if let NodeState::Follower(state) = &mut self.state {
-            state.extend_election_timeout(from);
+            state.extend_election_timeout(from, election_to);
         } else if term > self.term.seq {
             // If now leader or candidate and receive bigger term, we should start following the new leader
             debug!(
@@ -547,7 +560,7 @@ impl<T: Transport> RaftNode<T> {
             self.lh(),
             self.term.seq
         );
-        let mut state = CandidateState::new();
+        let mut state = CandidateState::new(self.next_election_timeout());
         state.vote_count += 1;
         self.state = NodeState::Candidate(state);
         let last = self.log.last_entry_id();
@@ -560,7 +573,7 @@ impl<T: Transport> RaftNode<T> {
 
     fn become_follower(&mut self, leader: Option<u32>) {
         debug!("{}: become FOLLOWER for leader {:?}", self.lh(), leader);
-        let state = FollowerState::new(leader);
+        let state = FollowerState::new(leader, self.next_election_timeout());
         self.state = NodeState::Follower(state);
     }
 
