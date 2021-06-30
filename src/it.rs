@@ -95,6 +95,21 @@ impl TestingContext {
     fn current_leader(&self) -> Option<u32> {
         self.current_leader_of(&self.list_status())
     }
+
+    fn current_values_of(&self, statuses: &[node::NodeStatus]) -> Vec<i32> {
+        statuses.into_iter().map(|st| st.value).collect()
+    }
+
+    fn current_values(&self) -> Vec<i32> {
+        self.current_values_of(&self.list_status())
+    }
+
+    fn leader_value(&self) -> i32 {
+        let statuses = self.list_status();
+        let leader = self.current_leader_of(&statuses).unwrap();
+        let values = self.current_values_of(&statuses);
+        values[leader as usize - 1]
+    }
 }
 
 #[test]
@@ -136,6 +151,103 @@ fn test_election() {
         );
         assert_eq!(leader as i32, statuses[i].leader);
         assert_eq!(last_term, statuses[i].term);
-        assert_eq!(statuses[0].value, statuses[i].value);
+    }
+
+    ctx.transport.lock().unwrap().down(leader);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    let statuses = ctx.list_status();
+    for i in 0..NUM_NODES {
+        let id = i as u32 + 1;
+        if id == take_down || id == leader {
+            continue;
+        }
+
+        assert_ne!("leader", statuses[i].state);
+        assert_eq!(-1, statuses[i].leader);
+    }
+
+    ctx.transport.lock().unwrap().up(take_down);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    let statuses = ctx.list_status();
+    let new_leader = ctx.current_leader_of(&statuses).unwrap();
+    for i in 0..NUM_NODES {
+        let id = i as u32 + 1;
+        if id == leader {
+            continue;
+        }
+
+        let is_leader = new_leader == (i + 1) as u32;
+        assert_eq!(
+            if is_leader { "leader" } else { "follower" },
+            statuses[i].state
+        );
+        assert_eq!(new_leader as i32, statuses[i].leader);
+        assert!(statuses[i].term > last_term);
+    }
+
+    ctx.transport.lock().unwrap().up(leader);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    let statuses = ctx.list_status();
+    let new_leader = ctx.current_leader_of(&statuses).unwrap();
+    for i in 0..NUM_NODES {
+        let is_leader = new_leader == (i + 1) as u32;
+        assert_eq!(
+            if is_leader { "leader" } else { "follower" },
+            statuses[i].state
+        );
+        assert_eq!(new_leader as i32, statuses[i].leader);
+        assert!(statuses[i].term > last_term);
+    }
+}
+
+#[test]
+fn test_replication() {
+    // env_logger::init();
+
+    let ctx = TestingContext::new(NUM_NODES);
+
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    // TODO: should try randomly and get redirected?
+    let leader = ctx.current_leader().unwrap();
+    if let node::Message::UpdateValueResult(err) = ctx.client.request(
+        leader,
+        node::Message::UpdateValue(node::ops::Operation::Set(10)),
+    ) {
+        assert_eq!(None, err);
+    }
+
+    assert_eq!(10, ctx.leader_value());
+
+    if let node::Message::UpdateValueResult(err) = ctx.client.request(
+        leader,
+        node::Message::UpdateValue(node::ops::Operation::Set(20)),
+    ) {
+        assert_eq!(None, err);
+    }
+    assert_eq!(20, ctx.leader_value());
+
+    let mut value = 20;
+    for _ in 0..ctx.node_ids.len() {
+        let leader = ctx.current_leader().unwrap();
+        thread::sleep(ELECTION_TIMEOUT_MAX);
+        ctx.transport.lock().unwrap().down(leader);
+        thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+        assert_eq!(value, ctx.leader_value());
+
+        let new_leader = ctx.current_leader().unwrap();
+        value += 10;
+        if let node::Message::UpdateValueResult(err) = ctx.client.request(
+            new_leader,
+            node::Message::UpdateValue(node::ops::Operation::Set(value)),
+        ) {
+            assert_eq!(None, err);
+        }
+        assert_eq!(value, ctx.leader_value());
+
+        ctx.transport.lock().unwrap().up(leader);
     }
 }

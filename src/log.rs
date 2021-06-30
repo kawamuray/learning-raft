@@ -46,8 +46,9 @@ impl Log {
         }
     }
 
-    pub fn append(&mut self, entry: LogEntry) {
+    pub fn append(&mut self, entry: LogEntry) -> usize {
         self.entries.push(entry);
+        self.last_index()
     }
 
     pub fn get(&self, index: usize) -> Option<&LogEntry> {

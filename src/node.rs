@@ -1,6 +1,7 @@
 use crate::log::{self as rlog, EntryId};
 use log::{debug, info};
 use rand::Rng;
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,9 +32,12 @@ impl Term {
     }
 }
 
+pub type ClientAddress = u32;
+
 pub struct LeaderState {
     next_append_at: Instant,
     replica_states: Vec<ReplicaState>,
+    pending_requests: VecDeque<(usize, ClientAddress)>,
 }
 
 impl LeaderState {
@@ -41,6 +45,7 @@ impl LeaderState {
         Self {
             next_append_at: Instant::now() + HEARTBEAT_TIMEOUT,
             replica_states: vec![ReplicaState::new(log); num_nodes],
+            pending_requests: VecDeque::new(),
         }
     }
 
@@ -56,6 +61,21 @@ impl LeaderState {
 
     fn replica_state_mut(&mut self, id: u32) -> &mut ReplicaState {
         &mut self.replica_states[id as usize - 1]
+    }
+
+    fn add_pending_request(&mut self, addr: u32, index: usize) {
+        self.pending_requests.push_back((index, addr));
+    }
+
+    fn client_responses(&mut self, commit_index: usize) -> Vec<(usize, u32)> {
+        let mut targets = Vec::new();
+        while let Some((index, _)) = self.pending_requests.front() {
+            if *index > commit_index {
+                break;
+            }
+            targets.push(self.pending_requests.pop_front().unwrap());
+        }
+        targets
     }
 }
 
@@ -483,6 +503,10 @@ impl<T: Transport> RaftNode<T> {
 
                         let hw = state.index_high_watermark(majority_count);
                         self.value = self.log.commit(hw, self.value);
+                        let responses = state.client_responses(hw);
+                        for (_index, addr) in responses {
+                            self.send_message(addr, Message::UpdateValueResult(None));
+                        }
                     }
                 } else {
                     if term > self.term.seq {
@@ -521,7 +545,7 @@ impl<T: Transport> RaftNode<T> {
             }
             Message::UpdateValue(op) => {
                 if let NodeState::Leader(state) = &mut self.state {
-                    self.log.append(rlog::LogEntry {
+                    let index = self.log.append(rlog::LogEntry {
                         term: self.term.seq,
                         op,
                     });
@@ -529,8 +553,7 @@ impl<T: Transport> RaftNode<T> {
                     replica_state.next_index = self.log.last_index() + 1;
                     replica_state.match_index = self.log.last_index();
 
-                    // TODO: not at this timining
-                    self.send_message(from, Message::UpdateValueResult(None))
+                    state.add_pending_request(from, index);
                 } else {
                     self.send_message(from, Message::UpdateValueResult(Some("not the leader")))
                 }
