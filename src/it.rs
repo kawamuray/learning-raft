@@ -1,6 +1,7 @@
 use crate::node::{self, Transport};
 use crate::transport::{self, InMemoryTransport};
 use env_logger;
+use std::sync::Once;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -8,6 +9,14 @@ use std::time::Duration;
 const NUM_NODES: usize = 3;
 const ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(150);
 const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(300);
+
+static INIT: Once = Once::new();
+
+fn setup() {
+    INIT.call_once(|| {
+        env_logger::init();
+    });
+}
 
 struct SyncRpcClient<T: Transport> {
     transport: Arc<Mutex<T>>,
@@ -114,7 +123,7 @@ impl TestingContext {
 
 #[test]
 fn test_election() {
-    env_logger::init();
+    setup();
 
     let ctx = TestingContext::new(NUM_NODES);
 
@@ -205,7 +214,7 @@ fn test_election() {
 
 #[test]
 fn test_replication() {
-    // env_logger::init();
+    setup();
 
     let ctx = TestingContext::new(NUM_NODES);
 
