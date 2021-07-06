@@ -1,10 +1,12 @@
+use crate::node;
 use crate::node::ops::Operation;
 use log::debug;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LogEntry {
     pub term: u64,
     pub op: Operation,
+    pub config_update: Option<node::ClusterConfig>,
 }
 
 #[derive(Debug)]

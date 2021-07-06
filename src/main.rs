@@ -22,8 +22,10 @@ fn main() {
     for i in 1..=NUM_NODES {
         let (tx, rx) = mpsc::channel();
         transport.lock().unwrap().add_node(tx);
-        let mut node = node::RaftNode::new(i as u32, node_ids.clone(), Arc::clone(&transport));
+        let ids = node_ids.clone();
+        let tp = Arc::clone(&transport);
         thread::spawn(move || {
+            let mut node = node::RaftNode::new(i as u32, ids, tp);
             node.run(rx);
         });
     }

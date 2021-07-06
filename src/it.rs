@@ -29,12 +29,16 @@ impl<T: Transport> SyncRpcClient<T> {
     }
 
     fn request(&self, to: u32, msg: node::Message) -> node::Message {
-        self.transport.lock().unwrap().send(0, to, msg);
+        self.send(to, msg);
         let (from, msg) = self.rx.recv().unwrap();
         if from != to {
             panic!("unexpected response from {}", from);
         }
         msg
+    }
+
+    fn send(&self, to: u32, msg: node::Message) {
+        self.transport.lock().unwrap().send(0, to, msg);
     }
 }
 
@@ -51,22 +55,31 @@ impl TestingContext {
 
         let (super_tx, super_rx) = mpsc::channel();
         transport.lock().unwrap().add_super_node(super_tx);
-        for i in 1..=num_nodes {
-            let (tx, rx) = mpsc::channel();
-            transport.lock().unwrap().add_node(tx);
-            let mut node = node::RaftNode::new(i as u32, node_ids.clone(), Arc::clone(&transport));
-            node.set_election_timeout(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
-            thread::spawn(move || {
-                node.run(rx);
-            });
-        }
 
         let client = SyncRpcClient::new(Arc::clone(&transport), super_rx);
-        Self {
+        let mut this = Self {
             node_ids,
             client,
             transport,
+        };
+
+        for i in 1..=num_nodes {
+            this.add_node(i as u32);
         }
+
+        this
+    }
+
+    fn add_node(&mut self, id: u32) {
+        let (tx, rx) = mpsc::channel();
+        self.transport.lock().unwrap().add_node(tx);
+        let tp = Arc::clone(&self.transport);
+        let ids = self.node_ids.clone();
+        thread::spawn(move || {
+            let mut node = node::RaftNode::new(id, ids, tp);
+            node.set_election_timeout(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
+            node.run(rx);
+        });
     }
 
     fn list_status(&self) -> Vec<node::NodeStatus> {
@@ -87,6 +100,9 @@ impl TestingContext {
     fn current_leader_of(&self, statuses: &[node::NodeStatus]) -> Option<u32> {
         let mut counts = vec![0; self.node_ids.len()];
         for st in statuses {
+            if st.leader == -1 {
+                continue;
+            }
             counts[st.leader as usize - 1] += 1;
         }
         let mut leaders: Vec<_> = counts
@@ -258,5 +274,80 @@ fn test_replication() {
         assert_eq!(value, ctx.leader_value());
 
         ctx.transport.lock().unwrap().up(leader);
+    }
+}
+
+#[test]
+fn test_membership_change() {
+    setup();
+
+    let mut ctx = TestingContext::new(NUM_NODES);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    let value = 10;
+    let leader = ctx.current_leader().unwrap();
+    if let node::Message::UpdateValueResult(err) = ctx.client.request(
+        leader,
+        node::Message::UpdateValue(node::ops::Operation::Set(value)),
+    ) {
+        assert_eq!(None, err);
+    }
+
+    let added_nodes = vec![NUM_NODES as u32 + 1, NUM_NODES as u32 + 2];
+    ctx.node_ids.extend(&added_nodes);
+    for &id in &added_nodes {
+        ctx.add_node(id);
+    }
+    ctx.client
+        .send(leader, node::Message::UpdateConfig(ctx.node_ids.clone()));
+
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+    ctx.transport.lock().unwrap().down(leader);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    // TODO: check for split brain?
+    let statuses = ctx.list_status();
+    let new_leader = ctx.current_leader_of(&statuses).unwrap();
+    for i in 0..ctx.node_ids.len() {
+        if i as u32 + 1 == leader {
+            continue;
+        }
+
+        let id = i as u32 + 1;
+        let is_leader = new_leader == id;
+        assert_eq!(
+            if is_leader { "leader" } else { "follower" },
+            statuses[i].state
+        );
+        assert_eq!(new_leader as i32, statuses[i].leader);
+        assert_eq!(statuses[new_leader as usize - 1].term, statuses[i].term);
+        if id != leader {
+            assert_eq!(value, statuses[i].value);
+        }
+    }
+
+    let value = 20;
+    if let node::Message::UpdateValueResult(err) = ctx.client.request(
+        new_leader,
+        node::Message::UpdateValue(node::ops::Operation::Set(value)),
+    ) {
+        assert_eq!(None, err);
+    }
+    ctx.transport.lock().unwrap().up(leader);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    let statuses = ctx.list_status();
+    let latest_leader = ctx.current_leader_of(&statuses).unwrap();
+    assert_eq!(value, ctx.leader_value());
+    for i in 0..ctx.node_ids.len() {
+        let id = i as u32 + 1;
+        let is_leader = latest_leader == id;
+        assert_eq!(
+            if is_leader { "leader" } else { "follower" },
+            statuses[i].state
+        );
+        assert_eq!(latest_leader as i32, statuses[i].leader);
+        assert_eq!(statuses[new_leader as usize - 1].term, statuses[i].term);
+        assert_eq!(value, statuses[i].value);
     }
 }

@@ -1,8 +1,11 @@
 use crate::log::{self as rlog, EntryId};
 use log::{debug, info};
 use rand::Rng;
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,33 +37,103 @@ impl Term {
 
 pub type ClientAddress = u32;
 
+struct ReplicaStates {
+    states: HashMap<u32, Rc<RefCell<ReplicaState>>>,
+}
+
+impl ReplicaStates {
+    fn new(ids: &[u32], log: &rlog::Log, current: Option<&ReplicaStates>) -> Self {
+        let mut states = HashMap::new();
+        for &id in ids {
+            if let Some(cur) = current {
+                if let Some(r) = cur.get(id) {
+                    states.insert(id, Rc::clone(r));
+                    continue;
+                }
+            }
+            states.insert(id, Rc::new(RefCell::new(ReplicaState::new(log))));
+        }
+        Self { states }
+    }
+
+    fn get(&self, id: u32) -> Option<&Rc<RefCell<ReplicaState>>> {
+        self.states.get(&id)
+    }
+
+    fn index_high_watermark(&self) -> usize {
+        let mut indexes: Vec<_> = self
+            .states
+            .values()
+            .map(|s| s.borrow().match_index)
+            .collect();
+        indexes.sort();
+        indexes[indexes.len() - self.majority_count()]
+    }
+
+    fn majority_count(&self) -> usize {
+        majority_count_of(self.states.len())
+    }
+}
+
+struct ReplicaStatesGroup {
+    current_replicas: ReplicaStates,
+    new_replicas: Option<ReplicaStates>,
+}
+
+impl ReplicaStatesGroup {
+    fn new(config: &ClusterConfig, log: &rlog::Log) -> Self {
+        let current = ReplicaStates::new(config.current_nodes.ids(), log, None);
+        let new_replicas = Self::new_replicas_value(config, log, &current);
+        Self {
+            current_replicas: current,
+            new_replicas,
+        }
+    }
+
+    fn new_replicas_value(
+        config: &ClusterConfig,
+        log: &rlog::Log,
+        current: &ReplicaStates,
+    ) -> Option<ReplicaStates> {
+        config
+            .new_nodes
+            .as_ref()
+            .map(|nodes| ReplicaStates::new(nodes.ids(), log, Some(current)))
+    }
+
+    fn index_high_watermark(&self) -> usize {
+        let mut hw = self.current_replicas.index_high_watermark();
+        if let Some(replicas) = &self.new_replicas {
+            hw = hw.min(replicas.index_high_watermark());
+        }
+        hw
+    }
+
+    fn get(&self, id: u32) -> &Rc<RefCell<ReplicaState>> {
+        self.current_replicas
+            .get(id)
+            .or_else(|| self.new_replicas.as_ref().and_then(|r| r.get(id)))
+            .unwrap()
+    }
+
+    fn set_new_replicas(&mut self, config: &ClusterConfig, log: &rlog::Log) {
+        self.new_replicas = Self::new_replicas_value(config, log, &self.current_replicas);
+    }
+}
+
 pub struct LeaderState {
     next_append_at: Instant,
-    replica_states: Vec<ReplicaState>,
+    replica_states: ReplicaStatesGroup,
     pending_requests: VecDeque<(usize, ClientAddress)>,
 }
 
 impl LeaderState {
-    pub fn new(num_nodes: usize, log: &rlog::Log) -> Self {
+    pub fn new(config: &ClusterConfig, log: &rlog::Log) -> Self {
         Self {
             next_append_at: Instant::now() + HEARTBEAT_TIMEOUT,
-            replica_states: vec![ReplicaState::new(log); num_nodes],
+            replica_states: ReplicaStatesGroup::new(config, log),
             pending_requests: VecDeque::new(),
         }
-    }
-
-    fn index_high_watermark(&self, majority: usize) -> usize {
-        let mut indexes: Vec<_> = self.replica_states.iter().map(|s| s.match_index).collect();
-        indexes.sort();
-        indexes[indexes.len() - majority]
-    }
-
-    fn replica_state(&self, id: u32) -> &ReplicaState {
-        &self.replica_states[id as usize - 1]
-    }
-
-    fn replica_state_mut(&mut self, id: u32) -> &mut ReplicaState {
-        &mut self.replica_states[id as usize - 1]
     }
 
     fn add_pending_request(&mut self, addr: u32, index: usize) {
@@ -94,11 +167,68 @@ impl ReplicaState {
     }
 }
 
+fn majority_count_of(num_nodes: usize) -> usize {
+    (num_nodes as f64 / 2.0).ceil() as usize
+}
+
+#[derive(Debug, Clone)]
+pub struct Nodes {
+    ids: Vec<u32>,
+}
+
+impl Nodes {
+    pub fn new(ids: Vec<u32>) -> Self {
+        Self { ids }
+    }
+
+    fn majority_count(&self) -> usize {
+        majority_count_of(self.ids.len())
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    log_index: usize,
+    current_nodes: Nodes,
+    new_nodes: Option<Nodes>,
+}
+
+impl ClusterConfig {
+    pub fn new(log_index: usize, nodes: Nodes, new_nodes: Option<Nodes>) -> Self {
+        Self {
+            log_index,
+            current_nodes: nodes,
+            new_nodes: new_nodes,
+        }
+    }
+
+    fn all_nodes(&self) -> Vec<u32> {
+        let mut seen = HashSet::new();
+        for &id in self.current_nodes.ids() {
+            seen.insert(id);
+        }
+        if let Some(new) = &self.new_nodes {
+            for &id in new.ids() {
+                seen.insert(id);
+            }
+        }
+        seen.into_iter().collect()
+    }
+}
+
 pub struct RaftNode<T: Transport> {
     id: u32,
     term: Term,
     transport: Arc<Mutex<T>>,
-    nodes: Vec<u32>,
+    config: ClusterConfig,
     state: NodeState,
     value: i32,
     log: rlog::Log,
@@ -109,6 +239,7 @@ pub struct RaftNode<T: Transport> {
 pub struct CandidateState {
     timeout_at: Instant,
     vote_count: usize,
+    new_vote_count: usize,
 }
 
 impl CandidateState {
@@ -116,6 +247,7 @@ impl CandidateState {
         Self {
             timeout_at: Instant::now() + election_timeout,
             vote_count: 0,
+            new_vote_count: 0,
         }
     }
 }
@@ -211,6 +343,8 @@ pub enum Message {
 
     UpdateValue(ops::Operation),
     UpdateValueResult(Option<&'static str>),
+    UpdateConfig(Vec<u32>),
+
     ShowStatus,
     Status(NodeStatus),
 }
@@ -220,7 +354,7 @@ impl<T: Transport> RaftNode<T> {
         let mut this = Self {
             id,
             term: Term::new(0),
-            nodes,
+            config: ClusterConfig::new(0, Nodes::new(nodes), None),
             transport,
             state: NodeState::Follower(FollowerState::new(None, Duration::from_secs(0))),
             value: 0,
@@ -399,6 +533,11 @@ impl<T: Transport> RaftNode<T> {
                 // Dedup. 5.5 Follower and candidate crashes
                 continue;
             }
+
+            if let Some(new_config) = &entry.config_update {
+                self.config = new_config.clone();
+            }
+
             debug!("{}: appending entry in follower: {:?}", self.lh(), entry);
             self.log.append(entry);
         }
@@ -418,15 +557,11 @@ impl<T: Transport> RaftNode<T> {
     }
 
     fn broadcast(&mut self, msg: Message) {
-        for &address in &self.nodes {
+        for address in self.config.all_nodes() {
             if address != self.id {
                 self.send_message(address, msg.clone());
             }
         }
-    }
-
-    fn majority_count(&self) -> usize {
-        (self.nodes.len() as f64 / 2.0).ceil() as usize
     }
 
     fn start_term(&mut self, term: u64) {
@@ -454,8 +589,22 @@ impl<T: Transport> RaftNode<T> {
                     return;
                 }
                 if let NodeState::Candidate(state) = &mut self.state {
-                    state.vote_count += 1;
-                    if state.vote_count >= self.majority_count() {
+                    let mut got_majority = false;
+                    if self.config.current_nodes.ids().contains(&from) {
+                        state.vote_count += 1;
+                        if state.vote_count >= self.config.current_nodes.majority_count() {
+                            got_majority = true;
+                        }
+                    }
+                    if let Some(new) = &self.config.new_nodes {
+                        if new.ids().contains(&from) {
+                            state.new_vote_count += 1;
+                        }
+                        if state.new_vote_count >= new.majority_count() {
+                            got_majority &= true;
+                        }
+                    }
+                    if got_majority {
                         self.become_leader();
                     }
                 }
@@ -484,11 +633,10 @@ impl<T: Transport> RaftNode<T> {
                 last_append_index,
             } => {
                 // TODO: should check term also?
-                let majority_count = self.majority_count();
                 let lh = self.lh();
                 if success {
-                    if let NodeState::Leader(state) = &mut self.state {
-                        let replica_state = state.replica_state_mut(from);
+                    let hw = if let NodeState::Leader(state) = &mut self.state {
+                        let mut replica_state = state.replica_states.get(from).borrow_mut();
                         if replica_state.next_index != last_append_index + 1 {
                             debug!(
                             "{}: Updating replica state [{}], next_index = {}, match_index = {}",
@@ -500,12 +648,32 @@ impl<T: Transport> RaftNode<T> {
                         }
                         replica_state.next_index = last_append_index + 1;
                         replica_state.match_index = last_append_index;
+                        drop(replica_state);
 
-                        let hw = state.index_high_watermark(majority_count);
+                        let hw = state.replica_states.index_high_watermark();
                         self.value = self.log.commit(hw, self.value);
                         let responses = state.client_responses(hw);
                         for (_index, addr) in responses {
                             self.send_message(addr, Message::UpdateValueResult(None));
+                        }
+
+                        hw
+                    } else {
+                        0
+                    };
+
+                    if self.log.committed_index() < self.config.log_index
+                        && hw >= self.config.log_index
+                    {
+                        // Commit this config update
+                        // TODO: should call a method
+                        if let Some(new_nodes) = &self.config.new_nodes {
+                            self.config = ClusterConfig::new(
+                                self.log.last_index() + 1,
+                                new_nodes.clone(),
+                                None,
+                            );
+                            self.append_log(from, ops::Operation::Noop, Some(self.config.clone()));
                         }
                     }
                 } else {
@@ -517,7 +685,7 @@ impl<T: Transport> RaftNode<T> {
                         // and retry.
                         // 5.3 Log replication
                         if let NodeState::Leader(state) = &mut self.state {
-                            let replica_state = state.replica_state_mut(from);
+                            let mut replica_state = state.replica_states.get(from).borrow_mut();
                             replica_state.next_index -= 1;
                         }
                         if let NodeState::Leader(state) = &self.state {
@@ -544,23 +712,46 @@ impl<T: Transport> RaftNode<T> {
                 // ignore
             }
             Message::UpdateValue(op) => {
-                if let NodeState::Leader(state) = &mut self.state {
-                    let index = self.log.append(rlog::LogEntry {
-                        term: self.term.seq,
-                        op,
-                    });
-                    let replica_state = state.replica_state_mut(self.id);
-                    replica_state.next_index = self.log.last_index() + 1;
-                    replica_state.match_index = self.log.last_index();
-
-                    state.add_pending_request(from, index);
-                } else {
-                    self.send_message(from, Message::UpdateValueResult(Some("not the leader")))
-                }
+                self.append_log(from, op, None);
             }
             Message::UpdateValueResult(_) => {
                 // ignore
             }
+            Message::UpdateConfig(new_nodes) => {
+                self.config = ClusterConfig::new(
+                    self.log.last_index() + 1,
+                    self.config.current_nodes.clone(),
+                    Some(Nodes::new(new_nodes)),
+                );
+                self.append_log(from, ops::Operation::Noop, Some(self.config.clone()));
+                // TODO: check if on-going migration exists?
+                if let NodeState::Leader(state) = &mut self.state {
+                    state
+                        .replica_states
+                        .set_new_replicas(&self.config, &self.log);
+                }
+            }
+        }
+    }
+
+    fn append_log(&mut self, from: u32, op: ops::Operation, config_update: Option<ClusterConfig>) {
+        let is_config_update = config_update.is_some();
+        if let NodeState::Leader(state) = &mut self.state {
+            let index = self.log.append(rlog::LogEntry {
+                term: self.term.seq,
+                op,
+                config_update,
+            });
+            let mut replica_state = state.replica_states.get(self.id).borrow_mut();
+            replica_state.next_index = self.log.last_index() + 1;
+            replica_state.match_index = self.log.last_index();
+            drop(replica_state);
+
+            if !is_config_update {
+                state.add_pending_request(from, index);
+            }
+        } else if !is_config_update {
+            self.send_message(from, Message::UpdateValueResult(Some("not the leader")))
         }
     }
 
@@ -585,6 +776,11 @@ impl<T: Transport> RaftNode<T> {
         );
         let mut state = CandidateState::new(self.next_election_timeout());
         state.vote_count += 1;
+        if let Some(new) = &self.config.new_nodes {
+            if new.ids().contains(&self.id) {
+                state.new_vote_count += 1;
+            }
+        }
         self.state = NodeState::Candidate(state);
         let last = self.log.last_entry_id();
         self.broadcast(Message::RequestVote {
@@ -602,12 +798,12 @@ impl<T: Transport> RaftNode<T> {
 
     fn become_leader(&mut self) {
         debug!("{}: become LEADER", self.lh());
-        let state = LeaderState::new(self.nodes.len(), &self.log);
+        let state = LeaderState::new(&self.config, &self.log);
         self.state = NodeState::Leader(state);
     }
 
     fn send_heartbeat(&self, id: u32, state: &LeaderState) {
-        let replica_state = state.replica_state(id);
+        let replica_state = state.replica_states.get(id).borrow();
         let entries = self.log.entries_from(replica_state.next_index).to_vec();
 
         let prev = self.log.entry_id_at(replica_state.next_index - 1);
@@ -623,9 +819,8 @@ impl<T: Transport> RaftNode<T> {
     }
 
     fn send_heartbeats(&mut self) {
-        // self.log_state("Sending heartbeats");
         if let NodeState::Leader(state) = &self.state {
-            for &id in &self.nodes {
+            for id in self.config.all_nodes() {
                 if id == self.id {
                     continue;
                 }
@@ -689,6 +884,7 @@ impl<T: Transport> RaftNode<T> {
 pub mod ops {
     #[derive(Clone, Copy, Debug)]
     pub enum Operation {
+        Noop,
         Set(i32),
         Increment(i32),
     }
@@ -696,6 +892,7 @@ pub mod ops {
     impl Operation {
         pub fn apply(&self, value: i32) -> i32 {
             match *self {
+                Operation::Noop => value,
                 Operation::Set(val) => val,
                 Operation::Increment(to_add) => value + to_add,
             }
