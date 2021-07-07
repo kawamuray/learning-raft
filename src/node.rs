@@ -16,6 +16,8 @@ pub const ELECTION_TIMEOUT_MAX: Duration = Duration::from_secs(10);
 // const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(300);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(50);
 
+const REPLICATION_CAUGHT_UP_DIFF: isize = 10;
+
 pub trait Transport {
     fn send(&mut self, from: u32, to: u32, msg: Message);
 }
@@ -101,10 +103,12 @@ impl ReplicaStatesGroup {
             .map(|nodes| ReplicaStates::new(nodes.ids(), log, Some(current)))
     }
 
-    fn index_high_watermark(&self) -> usize {
+    fn index_high_watermark(&self, joint_consensus: bool) -> usize {
         let mut hw = self.current_replicas.index_high_watermark();
-        if let Some(replicas) = &self.new_replicas {
-            hw = hw.min(replicas.index_high_watermark());
+        if joint_consensus {
+            if let Some(replicas) = &self.new_replicas {
+                hw = hw.min(replicas.index_high_watermark());
+            }
         }
         hw
     }
@@ -199,14 +203,21 @@ pub struct ClusterConfig {
     log_index: usize,
     current_nodes: Nodes,
     new_nodes: Option<Nodes>,
+    new_nodes_observer: bool,
 }
 
 impl ClusterConfig {
-    pub fn new(log_index: usize, nodes: Nodes, new_nodes: Option<Nodes>) -> Self {
+    pub fn new(
+        log_index: usize,
+        nodes: Nodes,
+        new_nodes: Option<Nodes>,
+        new_nodes_observer: bool,
+    ) -> Self {
         Self {
             log_index,
             current_nodes: nodes,
             new_nodes: new_nodes,
+            new_nodes_observer,
         }
     }
 
@@ -354,7 +365,7 @@ impl<T: Transport> RaftNode<T> {
         let mut this = Self {
             id,
             term: Term::new(0),
-            config: ClusterConfig::new(0, Nodes::new(nodes), None),
+            config: ClusterConfig::new(0, Nodes::new(nodes), None, false),
             transport,
             state: NodeState::Follower(FollowerState::new(None, Duration::from_secs(0))),
             value: 0,
@@ -600,10 +611,15 @@ impl<T: Transport> RaftNode<T> {
                         if new.ids().contains(&from) {
                             state.new_vote_count += 1;
                         }
-                        if state.new_vote_count >= new.majority_count() {
+                        // "The first issue" of cluster membership change.
+                        // Consider new nodes as majority only if they're voting members.
+                        if self.config.new_nodes_observer
+                            || state.new_vote_count >= new.majority_count()
+                        {
                             got_majority &= true;
                         }
                     }
+
                     if got_majority {
                         self.become_leader();
                     }
@@ -650,9 +666,41 @@ impl<T: Transport> RaftNode<T> {
                         replica_state.match_index = last_append_index;
                         drop(replica_state);
 
-                        let hw = state.replica_states.index_high_watermark();
+                        let hw = state
+                            .replica_states
+                            .index_high_watermark(!self.config.new_nodes_observer);
                         self.value = self.log.commit(hw, self.value);
                         let responses = state.client_responses(hw);
+
+                        // "The first issue" of cluster membership change.
+                        // Check if observer nodes are ready to be promoted to voting members.
+                        if self.config.new_nodes_observer {
+                            if let Some(new) = &state.replica_states.new_replicas {
+                                let diff =
+                                    (state.replica_states.current_replicas.index_high_watermark()
+                                        as isize
+                                        - new.index_high_watermark() as isize)
+                                        .abs();
+                                if diff <= REPLICATION_CAUGHT_UP_DIFF {
+                                    debug!(
+                                        "{}, Promoting observing NEW nodes into voting members",
+                                        self.lh()
+                                    );
+                                    self.config = ClusterConfig::new(
+                                        self.log.last_index() + 1,
+                                        self.config.current_nodes.clone(),
+                                        self.config.new_nodes.take(),
+                                        false,
+                                    );
+                                    self.append_log(
+                                        from,
+                                        ops::Operation::Noop,
+                                        Some(self.config.clone()),
+                                    );
+                                }
+                            }
+                        }
+
                         for (_index, addr) in responses {
                             self.send_message(addr, Message::UpdateValueResult(None));
                         }
@@ -668,12 +716,21 @@ impl<T: Transport> RaftNode<T> {
                         // Commit this config update
                         // TODO: should call a method
                         if let Some(new_nodes) = &self.config.new_nodes {
-                            self.config = ClusterConfig::new(
-                                self.log.last_index() + 1,
-                                new_nodes.clone(),
-                                None,
-                            );
-                            self.append_log(from, ops::Operation::Noop, Some(self.config.clone()));
+                            // "The first issue" of cluster membership change.
+                            // Added nodes are initially non-voting members.
+                            if !self.config.new_nodes_observer {
+                                self.config = ClusterConfig::new(
+                                    self.log.last_index() + 1,
+                                    new_nodes.clone(),
+                                    None,
+                                    false,
+                                );
+                                self.append_log(
+                                    from,
+                                    ops::Operation::Noop,
+                                    Some(self.config.clone()),
+                                );
+                            }
                         }
                     }
                 } else {
@@ -722,6 +779,7 @@ impl<T: Transport> RaftNode<T> {
                     self.log.last_index() + 1,
                     self.config.current_nodes.clone(),
                     Some(Nodes::new(new_nodes)),
+                    true,
                 );
                 self.append_log(from, ops::Operation::Noop, Some(self.config.clone()));
                 // TODO: check if on-going migration exists?
