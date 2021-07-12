@@ -351,3 +351,68 @@ fn test_membership_change() {
         assert_eq!(value, statuses[i].value);
     }
 }
+
+#[test]
+fn test_membership_change_migration() {
+    setup();
+
+    let mut ctx = TestingContext::new(NUM_NODES);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    let value = 10;
+    let leader = ctx.current_leader().unwrap();
+    if let node::Message::UpdateValueResult(err) = ctx.client.request(
+        leader,
+        node::Message::UpdateValue(node::ops::Operation::Set(value)),
+    ) {
+        assert_eq!(None, err);
+    }
+
+    let replace_nodes: Vec<_> = (1..=NUM_NODES).map(|i| (NUM_NODES + i) as u32).collect();
+    ctx.node_ids.extend(&replace_nodes);
+    for &id in &replace_nodes {
+        ctx.add_node(id);
+    }
+    ctx.client
+        .send(leader, node::Message::UpdateConfig(replace_nodes.clone()));
+
+    thread::sleep(ELECTION_TIMEOUT_MAX * 30);
+
+    let statuses = ctx.list_status();
+    let new_leader = ctx.current_leader_of(&statuses[NUM_NODES..]).unwrap();
+
+    // New leader must have elected from nodes in replacing group.
+    assert!(replace_nodes.contains(&new_leader));
+
+    for st in &statuses[NUM_NODES..] {
+        let is_leader = new_leader == st.id;
+        assert_eq!(if is_leader { "leader" } else { "follower" }, st.state);
+        assert_eq!(new_leader as i32, st.leader);
+        assert_eq!(statuses[new_leader as usize - 1].term, st.term);
+        assert_eq!(value, st.value);
+    }
+
+    for st in &statuses[..NUM_NODES] {
+        // All old nodes including ex-leader must have reverted its state to follower (or candidate).
+        assert_ne!("leader", st.state);
+    }
+
+    for id in 1..=NUM_NODES {
+        // Take down all old nodes
+        ctx.transport.lock().unwrap().down(id as u32);
+    }
+
+    let value = 20;
+    if let node::Message::UpdateValueResult(err) = ctx.client.request(
+        new_leader,
+        node::Message::UpdateValue(node::ops::Operation::Set(value)),
+    ) {
+        assert_eq!(None, err);
+    }
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    let statuses = ctx.list_status();
+    for st in &statuses[NUM_NODES..] {
+        assert_eq!(value, st.value);
+    }
+}

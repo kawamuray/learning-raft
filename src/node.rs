@@ -113,15 +113,21 @@ impl ReplicaStatesGroup {
         hw
     }
 
-    fn get(&self, id: u32) -> &Rc<RefCell<ReplicaState>> {
+    fn get(&self, id: u32) -> Option<&Rc<RefCell<ReplicaState>>> {
         self.current_replicas
             .get(id)
             .or_else(|| self.new_replicas.as_ref().and_then(|r| r.get(id)))
-            .unwrap()
     }
 
     fn set_new_replicas(&mut self, config: &ClusterConfig, log: &rlog::Log) {
         self.new_replicas = Self::new_replicas_value(config, log, &self.current_replicas);
+    }
+
+    fn promote(&mut self) -> Self {
+        Self {
+            current_replicas: self.new_replicas.take().unwrap(),
+            new_replicas: None,
+        }
     }
 }
 
@@ -233,6 +239,16 @@ impl ClusterConfig {
         }
         seen.into_iter().collect()
     }
+
+    fn is_voting_member(&self, id: u32) -> bool {
+        self.current_nodes.ids().contains(&id)
+            || self.new_nodes_observer
+                && self
+                    .new_nodes
+                    .as_ref()
+                    .map(|nodes| nodes.ids().contains(&id))
+                    .unwrap_or(false)
+    }
 }
 
 pub struct RaftNode<T: Transport> {
@@ -320,11 +336,13 @@ impl NodeState {
 
 #[derive(Clone, Debug)]
 pub struct NodeStatus {
+    pub id: u32,
     pub state: String,
     pub leader: i32,
     pub term: u64,
     pub election_timeout: Duration,
     pub value: i32,
+    pub config: ClusterConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -413,6 +431,16 @@ impl<T: Transport> RaftNode<T> {
         last_log_index: usize,
         last_log_term: u64,
     ) {
+        if !self.config.is_voting_member(from) {
+            debug!(
+                "{}: Not voting for {} because it is not an active member",
+                self.lh(),
+                from
+            );
+            self.send_vote_rejection(from);
+            return;
+        }
+
         if term < self.term.seq {
             // Do not vote if candidate's term is below mine.
             debug!(
@@ -506,6 +534,8 @@ impl<T: Transport> RaftNode<T> {
             return;
         }
 
+        // debug!("{}: AppendEntries from {}", self.lh(), leader_id);
+
         let election_to = self.next_election_timeout();
         if let NodeState::Follower(state) = &mut self.state {
             state.extend_election_timeout(from, election_to);
@@ -546,6 +576,11 @@ impl<T: Transport> RaftNode<T> {
             }
 
             if let Some(new_config) = &entry.config_update {
+                debug!(
+                    "{}: in follower config becomes: {:?}",
+                    self.lh(),
+                    new_config
+                );
                 self.config = new_config.clone();
             }
 
@@ -554,6 +589,7 @@ impl<T: Transport> RaftNode<T> {
         }
 
         if leader_commit > self.log.committed_index() {
+            debug!("{}: Committing {}", self.lh(), leader_commit);
             self.value = self.log.commit(leader_commit, self.value);
         }
 
@@ -599,6 +635,7 @@ impl<T: Transport> RaftNode<T> {
                 if !vote_granted {
                     return;
                 }
+
                 if let NodeState::Candidate(state) = &mut self.state {
                     let mut got_majority = false;
                     if self.config.current_nodes.ids().contains(&from) {
@@ -613,11 +650,8 @@ impl<T: Transport> RaftNode<T> {
                         }
                         // "The first issue" of cluster membership change.
                         // Consider new nodes as majority only if they're voting members.
-                        if self.config.new_nodes_observer
-                            || state.new_vote_count >= new.majority_count()
-                        {
-                            got_majority &= true;
-                        }
+                        got_majority &= self.config.new_nodes_observer
+                            || state.new_vote_count >= new.majority_count();
                     }
 
                     if got_majority {
@@ -648,11 +682,18 @@ impl<T: Transport> RaftNode<T> {
                 success,
                 last_append_index,
             } => {
+                let last_commit_index = self.log.committed_index();
+
                 // TODO: should check term also?
                 let lh = self.lh();
                 if success {
-                    let hw = if let NodeState::Leader(state) = &mut self.state {
-                        let mut replica_state = state.replica_states.get(from).borrow_mut();
+                    if let NodeState::Leader(state) = &mut self.state {
+                        let replica_state = state.replica_states.get(from);
+                        if replica_state.is_none() {
+                            return;
+                        }
+                        let mut replica_state = replica_state.unwrap().borrow_mut();
+
                         if replica_state.next_index != last_append_index + 1 {
                             debug!(
                             "{}: Updating replica state [{}], next_index = {}, match_index = {}",
@@ -669,7 +710,10 @@ impl<T: Transport> RaftNode<T> {
                         let hw = state
                             .replica_states
                             .index_high_watermark(!self.config.new_nodes_observer);
-                        self.value = self.log.commit(hw, self.value);
+                        if hw > self.log.committed_index() {
+                            debug!("{}: Committing {} in leader", lh, hw);
+                            self.value = self.log.commit(hw, self.value);
+                        }
                         let responses = state.client_responses(hw);
 
                         // "The first issue" of cluster membership change.
@@ -683,8 +727,9 @@ impl<T: Transport> RaftNode<T> {
                                         .abs();
                                 if diff <= REPLICATION_CAUGHT_UP_DIFF {
                                     debug!(
-                                        "{}, Promoting observing NEW nodes into voting members",
-                                        self.lh()
+                                        "{}, Promoting observing NEW nodes into voting members, index = {}",
+                                        self.lh(),
+                                        self.log.last_index() + 1,
                                     );
                                     self.config = ClusterConfig::new(
                                         self.log.last_index() + 1,
@@ -704,14 +749,10 @@ impl<T: Transport> RaftNode<T> {
                         for (_index, addr) in responses {
                             self.send_message(addr, Message::UpdateValueResult(None));
                         }
+                    }
 
-                        hw
-                    } else {
-                        0
-                    };
-
-                    if self.log.committed_index() < self.config.log_index
-                        && hw >= self.config.log_index
+                    if last_commit_index < self.config.log_index
+                        && self.log.committed_index() >= self.config.log_index
                     {
                         // Commit this config update
                         // TODO: should call a method
@@ -725,11 +766,28 @@ impl<T: Transport> RaftNode<T> {
                                     None,
                                     false,
                                 );
+                                debug!(
+                                    "{}: in leader config becomes: {:?}",
+                                    self.lh(),
+                                    self.config
+                                );
+                                if let NodeState::Leader(state) = &mut self.state {
+                                    state.replica_states = state.replica_states.promote();
+                                }
                                 self.append_log(
                                     from,
                                     ops::Operation::Noop,
                                     Some(self.config.clone()),
                                 );
+                            }
+                        } else {
+                            debug!("{}: Update config done", self.lh());
+                            // "The second issue" of cluster membership change.
+                            // The current leader should step down from leader role if its ID
+                            // isn't included in latest nodes list.
+                            if !self.config.is_voting_member(self.id) {
+                                debug!("{}: Stepping down from leader", self.lh());
+                                self.become_follower(None);
                             }
                         }
                     }
@@ -742,8 +800,9 @@ impl<T: Transport> RaftNode<T> {
                         // and retry.
                         // 5.3 Log replication
                         if let NodeState::Leader(state) = &mut self.state {
-                            let mut replica_state = state.replica_states.get(from).borrow_mut();
-                            replica_state.next_index -= 1;
+                            if let Some(replica_state) = state.replica_states.get(from) {
+                                replica_state.borrow_mut().next_index -= 1;
+                            }
                         }
                         if let NodeState::Leader(state) = &self.state {
                             self.send_heartbeat(from, state);
@@ -753,15 +812,23 @@ impl<T: Transport> RaftNode<T> {
             }
             Message::ShowStatus => {
                 let status = NodeStatus {
+                    id: self.id,
                     state: self.state.to_string(),
                     leader: self.current_leader(),
                     term: self.term.seq,
                     election_timeout: match &self.state {
-                        NodeState::Follower(st) => st.next_election_at - Instant::now(),
-                        NodeState::Candidate(st) => st.timeout_at - Instant::now(),
+                        NodeState::Follower(st) => st
+                            .next_election_at
+                            .checked_duration_since(Instant::now())
+                            .unwrap_or_default(),
+                        NodeState::Candidate(st) => st
+                            .timeout_at
+                            .checked_duration_since(Instant::now())
+                            .unwrap_or_default(),
                         NodeState::Leader(_) => Duration::from_millis(0),
                     },
                     value: self.value,
+                    config: self.config.clone(),
                 };
                 self.send_message(from, Message::Status(status));
             }
@@ -800,10 +867,10 @@ impl<T: Transport> RaftNode<T> {
                 op,
                 config_update,
             });
-            let mut replica_state = state.replica_states.get(self.id).borrow_mut();
-            replica_state.next_index = self.log.last_index() + 1;
-            replica_state.match_index = self.log.last_index();
-            drop(replica_state);
+            if let Some(replica_state) = state.replica_states.get(self.id) {
+                replica_state.borrow_mut().next_index = self.log.last_index() + 1;
+                replica_state.borrow_mut().match_index = self.log.last_index();
+            }
 
             if !is_config_update {
                 state.add_pending_request(from, index);
@@ -861,19 +928,24 @@ impl<T: Transport> RaftNode<T> {
     }
 
     fn send_heartbeat(&self, id: u32, state: &LeaderState) {
-        let replica_state = state.replica_states.get(id).borrow();
-        let entries = self.log.entries_from(replica_state.next_index).to_vec();
+        // TODO: why just .unwrap() works here?
+        if let Some(replica_state) = state.replica_states.get(id) {
+            let entries = self
+                .log
+                .entries_from(replica_state.borrow().next_index)
+                .to_vec();
 
-        let prev = self.log.entry_id_at(replica_state.next_index - 1);
-        let msg = Message::AppendEntries {
-            term: self.term.seq,
-            leader_id: self.id,
-            prev_log_index: prev.index,
-            prev_log_term: prev.term,
-            entries,
-            leader_commit: self.log.committed_index(),
-        };
-        self.send_message(id, msg);
+            let prev = self.log.entry_id_at(replica_state.borrow().next_index - 1);
+            let msg = Message::AppendEntries {
+                term: self.term.seq,
+                leader_id: self.id,
+                prev_log_index: prev.index,
+                prev_log_term: prev.term,
+                entries,
+                leader_commit: self.log.committed_index(),
+            };
+            self.send_message(id, msg);
+        }
     }
 
     fn send_heartbeats(&mut self) {
@@ -920,11 +992,7 @@ impl<T: Transport> RaftNode<T> {
         let mut next_timeout = Instant::now();
         loop {
             let now = Instant::now();
-            let timeout = if next_timeout > now {
-                next_timeout - now
-            } else {
-                Duration::from_secs(0)
-            };
+            let timeout = next_timeout.checked_duration_since(now).unwrap_or_default();
             match rx.recv_timeout(timeout) {
                 Ok((from, msg)) => self.recv(from, msg),
                 Err(e) => match e {
