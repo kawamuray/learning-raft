@@ -281,6 +281,7 @@ impl CandidateState {
 
 pub struct FollowerState {
     next_election_at: Instant,
+    last_heartbeat_at: Option<Instant>,
     leader: Option<u32>,
 }
 
@@ -288,6 +289,7 @@ impl FollowerState {
     pub fn new(leader: Option<u32>, election_timeout: Duration) -> Self {
         Self {
             next_election_at: Instant::now() + election_timeout,
+            last_heartbeat_at: None,
             leader,
         }
     }
@@ -298,7 +300,15 @@ impl FollowerState {
             self.leader = Some(from);
         }
 
-        self.next_election_at = Instant::now() + timeout;
+        let now = Instant::now();
+        self.next_election_at = now + timeout;
+        self.last_heartbeat_at = Some(now);
+    }
+
+    fn last_heartbeat_within(&self, duration: Duration) -> bool {
+        self.last_heartbeat_at
+            .map(|at| Instant::now() - at <= duration)
+            .unwrap_or(false)
     }
 }
 
@@ -441,6 +451,18 @@ impl<T: Transport> RaftNode<T> {
             return;
         }
 
+        if let NodeState::Follower(state) = &self.state {
+            if state.last_heartbeat_within(self.election_timeout_min) {
+                debug!(
+                    "{}: Not voting for {} because {:?} has not elapsed since last heartbeat",
+                    self.lh(),
+                    from,
+                    self.election_timeout_min
+                );
+                self.send_vote_rejection(from);
+                return;
+            }
+        }
         if term < self.term.seq {
             // Do not vote if candidate's term is below mine.
             debug!(
