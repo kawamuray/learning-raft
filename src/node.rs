@@ -397,7 +397,7 @@ impl<T: Transport> RaftNode<T> {
             transport,
             state: NodeState::Follower(FollowerState::new(None, Duration::from_secs(0))),
             value: 0,
-            log: rlog::Log::new(),
+            log: rlog::Log::new(0),
             election_timeout_min: ELECTION_TIMEOUT_MIN,
             election_timeout_max: ELECTION_TIMEOUT_MAX,
         };
@@ -572,7 +572,7 @@ impl<T: Transport> RaftNode<T> {
             self.become_follower(Some(from));
         }
 
-        if prev_log_index > 0 {
+        if prev_log_index > self.log.base_index {
             if let Some(entry) = self.log.get(prev_log_index) {
                 if entry.term != prev_log_term {
                     // Conflict

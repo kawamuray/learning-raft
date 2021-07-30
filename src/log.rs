@@ -12,21 +12,27 @@ pub struct LogEntry {
 #[derive(Debug)]
 pub struct Log {
     entries: Vec<LogEntry>,
+    pub base_index: usize,
     commit_index: usize,
     last_applied: usize,
 }
 
 impl Log {
-    pub fn new() -> Self {
+    pub fn new(base_index: usize) -> Self {
         Self {
             entries: Vec::new(),
-            commit_index: 0,
-            last_applied: 0,
+            base_index,
+            commit_index: base_index,
+            last_applied: base_index,
         }
     }
 
+    fn pos(&self, index: usize) -> usize {
+        index - self.base_index - 1
+    }
+
     pub fn last_index(&self) -> usize {
-        self.entries.len()
+        self.base_index + self.entries.len()
     }
 
     pub fn committed_index(&self) -> usize {
@@ -44,7 +50,10 @@ impl Log {
                 term: entry.term,
             }
         } else {
-            EntryId { index: 0, term: 0 }
+            EntryId {
+                index: self.base_index,
+                term: 0,
+            }
         }
     }
 
@@ -54,14 +63,14 @@ impl Log {
     }
 
     pub fn get(&self, index: usize) -> Option<&LogEntry> {
-        if index == 0 {
+        if index <= self.base_index {
             return None;
         }
-        self.entries.get(index - 1)
+        self.entries.get(self.pos(index))
     }
 
     pub fn truncate_to(&mut self, index: usize) {
-        self.entries.truncate(index);
+        self.entries.truncate(index - self.base_index);
     }
 
     pub fn commit(&mut self, index: usize, initial_value: i32) -> i32 {
@@ -77,7 +86,7 @@ impl Log {
     }
 
     pub fn entries_from(&self, from: usize) -> &[LogEntry] {
-        &self.entries[(from - 1)..]
+        &self.entries[self.pos(from)..]
     }
 }
 
