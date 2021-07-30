@@ -10,6 +10,8 @@ const NUM_NODES: usize = 3;
 const ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(150);
 const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(300);
 
+const MAX_LOG_SIZE: usize = 5;
+
 static INIT: Once = Once::new();
 
 fn setup() {
@@ -78,6 +80,7 @@ impl TestingContext {
         thread::spawn(move || {
             let mut node = node::RaftNode::new(id, ids, tp);
             node.set_election_timeout(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
+            node.set_max_log_size(MAX_LOG_SIZE);
             node.run(rx);
         });
     }
@@ -414,5 +417,33 @@ fn test_membership_change_migration() {
     let statuses = ctx.list_status();
     for st in &statuses[NUM_NODES..] {
         assert_eq!(value, st.value);
+    }
+}
+
+#[test]
+fn test_snapshot() {
+    setup();
+
+    let mut ctx = TestingContext::new(NUM_NODES);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    let leader = ctx.current_leader().unwrap();
+    let mut value = 10;
+    for _ in 0..(MAX_LOG_SIZE * 2) {
+        value += 1;
+        if let node::Message::UpdateValueResult(err) = ctx.client.request(
+            leader,
+            node::Message::UpdateValue(node::ops::Operation::Set(value)),
+        ) {
+            assert_eq!(None, err);
+        }
+    }
+
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    let statuses = ctx.list_status();
+    for st in &statuses {
+        assert_eq!(value, st.value);
+        assert!(st.log_size <= MAX_LOG_SIZE);
     }
 }

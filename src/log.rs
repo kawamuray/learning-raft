@@ -27,6 +27,10 @@ impl Log {
         }
     }
 
+    pub fn size(&self) -> usize {
+        self.entries.len()
+    }
+
     fn pos(&self, index: usize) -> usize {
         index - self.base_index - 1
     }
@@ -73,6 +77,11 @@ impl Log {
         self.entries.truncate(index - self.base_index);
     }
 
+    pub fn drop_until(&mut self, index: usize) {
+        self.entries.drain(0..=self.pos(index));
+        self.base_index = index;
+    }
+
     pub fn commit(&mut self, index: usize, initial_value: i32) -> i32 {
         self.commit_index = index.min(self.last_index());
 
@@ -94,4 +103,23 @@ impl Log {
 pub struct EntryId {
     pub index: usize,
     pub term: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub last_index: usize,
+    pub last_term: u64,
+    pub value: i32,
+    pub config: node::ClusterConfig,
+}
+
+impl Snapshot {
+    pub fn new(last_index: usize, last_term: u64, value: i32, config: node::ClusterConfig) -> Self {
+        Self {
+            last_index,
+            last_term,
+            value,
+            config,
+        }
+    }
 }

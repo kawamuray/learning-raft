@@ -261,6 +261,8 @@ pub struct RaftNode<T: Transport> {
     log: rlog::Log,
     election_timeout_min: Duration,
     election_timeout_max: Duration,
+    snapshot: Option<rlog::Snapshot>,
+    max_log_size: usize,
 }
 
 pub struct CandidateState {
@@ -353,6 +355,7 @@ pub struct NodeStatus {
     pub election_timeout: Duration,
     pub value: i32,
     pub config: ClusterConfig,
+    pub log_size: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -400,6 +403,8 @@ impl<T: Transport> RaftNode<T> {
             log: rlog::Log::new(0),
             election_timeout_min: ELECTION_TIMEOUT_MIN,
             election_timeout_max: ELECTION_TIMEOUT_MAX,
+            snapshot: None,
+            max_log_size: 100,
         };
         this.become_follower(None);
         this
@@ -409,6 +414,10 @@ impl<T: Transport> RaftNode<T> {
         self.election_timeout_min = min;
         self.election_timeout_max = max;
         self.become_follower(None);
+    }
+
+    pub fn set_max_log_size(&mut self, size: usize) {
+        self.max_log_size = size;
     }
 
     fn next_election_timeout(&self) -> Duration {
@@ -608,6 +617,7 @@ impl<T: Transport> RaftNode<T> {
 
             debug!("{}: appending entry in follower: {:?}", self.lh(), entry);
             self.log.append(entry);
+            self.maybe_snapshot();
         }
 
         if leader_commit > self.log.committed_index() {
@@ -639,6 +649,40 @@ impl<T: Transport> RaftNode<T> {
 
     fn renew_term(&mut self) {
         self.term = Term::new(self.term.seq + 1);
+    }
+
+    fn maybe_snapshot(&mut self) {
+        if self.log.size() > self.max_log_size {
+            self.snapshot();
+        }
+    }
+
+    fn snapshot(&mut self) {
+        let last_index = self.log.committed_index();
+        let last_term = self.log.get(last_index).unwrap().term;
+        self.snapshot = Some(rlog::Snapshot::new(
+            last_index,
+            last_term,
+            self.value,
+            self.config.clone(),
+        ));
+        eprintln!("{}: Took a new snapshot: {:?}", self.lh(), self.snapshot);
+
+        self.log.drop_until(last_index);
+    }
+
+    fn apply_snapshot(&mut self, snapshot: rlog::Snapshot) {
+        let mut drop_index = self.log.last_index();
+        if let Some(entry) = self.log.get(snapshot.last_index) {
+            if entry.term == snapshot.last_term {
+                self.log.drop_until(drop_index);
+            }
+        }
+
+        self.log = rlog::Log::new(snapshot.last_index);
+        self.value = snapshot.value;
+        self.config = snapshot.config.clone();
+        self.snapshot = Some(snapshot);
     }
 
     pub fn recv(&mut self, from: u32, msg: Message) {
@@ -851,6 +895,7 @@ impl<T: Transport> RaftNode<T> {
                     },
                     value: self.value,
                     config: self.config.clone(),
+                    log_size: self.log.size(),
                 };
                 self.send_message(from, Message::Status(status));
             }
@@ -883,12 +928,14 @@ impl<T: Transport> RaftNode<T> {
 
     fn append_log(&mut self, from: u32, op: ops::Operation, config_update: Option<ClusterConfig>) {
         let is_config_update = config_update.is_some();
+
         if let NodeState::Leader(state) = &mut self.state {
             let index = self.log.append(rlog::LogEntry {
                 term: self.term.seq,
                 op,
                 config_update,
             });
+
             if let Some(replica_state) = state.replica_states.get(self.id) {
                 replica_state.borrow_mut().next_index = self.log.last_index() + 1;
                 replica_state.borrow_mut().match_index = self.log.last_index();
@@ -898,8 +945,11 @@ impl<T: Transport> RaftNode<T> {
                 state.add_pending_request(from, index);
             }
         } else if !is_config_update {
-            self.send_message(from, Message::UpdateValueResult(Some("not the leader")))
+            self.send_message(from, Message::UpdateValueResult(Some("not the leader")));
+            return;
         }
+
+        self.maybe_snapshot();
     }
 
     fn current_leader(&self) -> i32 {
