@@ -382,6 +382,10 @@ pub enum Message {
         success: bool,
         last_append_index: usize,
     },
+    InstallSnapshot {
+        term: u64,
+        snapshot: rlog::Snapshot,
+    },
 
     UpdateValue(ops::Operation),
     UpdateValueResult(Option<&'static str>),
@@ -400,7 +404,7 @@ impl<T: Transport> RaftNode<T> {
             transport,
             state: NodeState::Follower(FollowerState::new(None, Duration::from_secs(0))),
             value: 0,
-            log: rlog::Log::new(0),
+            log: rlog::Log::new(0, 0),
             election_timeout_min: ELECTION_TIMEOUT_MIN,
             election_timeout_max: ELECTION_TIMEOUT_MAX,
             snapshot: None,
@@ -666,20 +670,20 @@ impl<T: Transport> RaftNode<T> {
             self.value,
             self.config.clone(),
         ));
-        eprintln!("{}: Took a new snapshot: {:?}", self.lh(), self.snapshot);
+        debug!("{}: Took a new snapshot: {:?}", self.lh(), self.snapshot);
 
         self.log.drop_until(last_index);
     }
 
     fn apply_snapshot(&mut self, snapshot: rlog::Snapshot) {
-        let mut drop_index = self.log.last_index();
         if let Some(entry) = self.log.get(snapshot.last_index) {
             if entry.term == snapshot.last_term {
-                self.log.drop_until(drop_index);
+                self.log.drop_until(snapshot.last_index);
+                return;
             }
         }
 
-        self.log = rlog::Log::new(snapshot.last_index);
+        self.log = rlog::Log::new(snapshot.last_index, snapshot.last_term);
         self.value = snapshot.value;
         self.config = snapshot.config.clone();
         self.snapshot = Some(snapshot);
@@ -923,6 +927,43 @@ impl<T: Transport> RaftNode<T> {
                         .set_new_replicas(&self.config, &self.log);
                 }
             }
+            Message::InstallSnapshot { term, snapshot } => {
+                if term < self.term.seq {
+                    debug!(
+                        "{}: Dropping InstallSnapshot from {} due to low term: {} < {}",
+                        self.lh(),
+                        from,
+                        term,
+                        self.term.seq
+                    );
+                }
+
+                if term > self.term.seq {
+                    self.start_term(term);
+                    debug!(
+                        "{}: Starting new term and becoming follower {} by InstallSnapshot from {}",
+                        self.lh(),
+                        self.term.seq,
+                        from
+                    );
+                    self.become_follower(Some(from));
+                }
+
+                debug!(
+                    "{}: Recoverying state by InstallSnapshot from {}",
+                    self.lh(),
+                    from
+                );
+                self.apply_snapshot(snapshot);
+                self.send_message(
+                    from,
+                    Message::AppendEntriesResponse {
+                        term: self.term.seq,
+                        success: true,
+                        last_append_index: self.log.last_index(),
+                    },
+                );
+            }
         }
     }
 
@@ -1002,19 +1043,32 @@ impl<T: Transport> RaftNode<T> {
     fn send_heartbeat(&self, id: u32, state: &LeaderState) {
         // TODO: why just .unwrap() works here?
         if let Some(replica_state) = state.replica_states.get(id) {
-            let entries = self
-                .log
-                .entries_from(replica_state.borrow().next_index)
-                .to_vec();
+            let next_index = replica_state.borrow().next_index;
 
-            let prev = self.log.entry_id_at(replica_state.borrow().next_index - 1);
-            let msg = Message::AppendEntries {
-                term: self.term.seq,
-                leader_id: self.id,
-                prev_log_index: prev.index,
-                prev_log_term: prev.term,
-                entries,
-                leader_commit: self.log.committed_index(),
+            // 7. Log Compaction
+            // if a follower has only way behind log which had already removed form leader's log entries,
+            // we need to first recover follower state by installing our snapshot.
+            let msg = if next_index <= self.log.base_index {
+                debug!(
+                    "{}: Sending InstallSnapshot to recover follower state of {}",
+                    self.lh(),
+                    id
+                );
+                Message::InstallSnapshot {
+                    term: self.term.seq,
+                    snapshot: self.snapshot.as_ref().unwrap().clone(),
+                }
+            } else {
+                let entries = self.log.entries_from(next_index).to_vec();
+                let prev = self.log.entry_id_at(next_index - 1);
+                Message::AppendEntries {
+                    term: self.term.seq,
+                    leader_id: self.id,
+                    prev_log_index: prev.index,
+                    prev_log_term: prev.term,
+                    entries,
+                    leader_commit: self.log.committed_index(),
+                }
             };
             self.send_message(id, msg);
         }

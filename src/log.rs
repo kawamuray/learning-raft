@@ -13,15 +13,17 @@ pub struct LogEntry {
 pub struct Log {
     entries: Vec<LogEntry>,
     pub base_index: usize,
+    base_term: u64,
     commit_index: usize,
     last_applied: usize,
 }
 
 impl Log {
-    pub fn new(base_index: usize) -> Self {
+    pub fn new(base_index: usize, base_term: u64) -> Self {
         Self {
             entries: Vec::new(),
             base_index,
+            base_term,
             commit_index: base_index,
             last_applied: base_index,
         }
@@ -56,7 +58,7 @@ impl Log {
         } else {
             EntryId {
                 index: self.base_index,
-                term: 0,
+                term: self.base_term,
             }
         }
     }

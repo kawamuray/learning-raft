@@ -424,10 +424,14 @@ fn test_membership_change_migration() {
 fn test_snapshot() {
     setup();
 
-    let mut ctx = TestingContext::new(NUM_NODES);
+    let ctx = TestingContext::new(NUM_NODES);
     thread::sleep(ELECTION_TIMEOUT_MAX * 2);
 
     let leader = ctx.current_leader().unwrap();
+    let take_down = *ctx.node_ids.iter().find(|x| **x != leader).unwrap();
+    ctx.transport.lock().unwrap().down(take_down);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
     let mut value = 10;
     for _ in 0..(MAX_LOG_SIZE * 2) {
         value += 1;
@@ -440,6 +444,9 @@ fn test_snapshot() {
     }
 
     thread::sleep(ELECTION_TIMEOUT_MAX * 2);
+
+    ctx.transport.lock().unwrap().up(take_down);
+    thread::sleep(ELECTION_TIMEOUT_MAX * 4);
 
     let statuses = ctx.list_status();
     for st in &statuses {
