@@ -103,8 +103,8 @@ impl Log {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EntryId {
-    pub index: usize,
     pub term: u64,
+    pub index: usize,
 }
 
 #[derive(Clone, Debug)]
